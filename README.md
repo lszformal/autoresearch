@@ -39,6 +39,23 @@ uv run train.py
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 
+
+## Results analysis helper
+
+As experiments accumulate in `results.tsv`, it becomes hard to quickly spot trends by eye.
+Use the included helper to summarize progress and list the best runs:
+
+```bash
+uv run python analyze_results.py
+```
+
+Optional flags:
+
+- `--path` to read a different TSV file
+- `--top` to control how many top runs are displayed
+
+This keeps the loop lightweight while still giving you a quick dashboard after long autonomous runs.
+
 ## Running the agent
 
 Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
