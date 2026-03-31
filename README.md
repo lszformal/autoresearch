@@ -49,6 +49,25 @@ Hi have a look at program.md and let's kick off a new experiment! let's do the s
 
 The `program.md` file is essentially a super lightweight "skill".
 
+## Better research hygiene (reproducibility + machine-readable logs)
+
+This repo now supports lightweight experiment metadata export directly from `train.py`.
+
+- `SEED` in `train.py` is now the single source of truth for random seeding.
+- `REPRO_MODE=True` enables stricter deterministic settings (`torch.use_deterministic_algorithms`) for debugging reproducibility regressions.
+- `train.py` always prints `seed` and `git_commit` in the final summary.
+- Optional environment variables:
+  - `AUTORESEARCH_SUMMARY_PATH=/path/to/summary.json` writes one structured JSON summary for the run.
+  - `AUTORESEARCH_METRICS_JSONL=/path/to/runs.jsonl` appends one JSON line per run (great for dashboards or quick pandas analysis).
+
+Example:
+
+```bash
+AUTORESEARCH_SUMMARY_PATH=run_summary.json \
+AUTORESEARCH_METRICS_JSONL=results.jsonl \
+uv run train.py
+```
+
 ## Project structure
 
 ```
