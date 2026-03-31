@@ -49,12 +49,32 @@ Hi have a look at program.md and let's kick off a new experiment! let's do the s
 
 The `program.md` file is essentially a super lightweight "skill".
 
+
+## Experiment tracking utilities
+
+To make autonomous loops easier to analyze and reproduce, this repo now includes `analyze_results.py` for strict run-log parsing and `results.tsv` management:
+
+```bash
+# Parse metrics from a run log
+uv run analyze_results.py parse --log run.log
+
+# Append a new row to results.tsv (auto-creates file + header if missing)
+uv run analyze_results.py append --log run.log --status keep --description "baseline"
+
+# Show best kept runs and compact trend summary
+uv run analyze_results.py leaderboard --top 10
+uv run analyze_results.py trend
+```
+
+This removes brittle `grep`/manual formatting steps and keeps experiment records consistent across agents and runs.
+
 ## Project structure
 
 ```
 prepare.py      — constants, data prep + runtime utilities (do not modify)
 train.py        — model, optimizer, training loop (agent modifies this)
 program.md      — agent instructions
+analyze_results.py — run log parsing + results.tsv tooling
 pyproject.toml  — dependencies
 ```
 
