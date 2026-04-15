@@ -82,15 +82,24 @@ def ensure_results_file(path: Path) -> None:
         )
 
 
-def append_result(path: Path, summary: RunSummary, status: str, description: str, commit: str) -> None:
+def append_result(
+    path: Path,
+    summary: RunSummary | None,
+    status: str,
+    description: str,
+    commit: str,
+) -> None:
     ensure_results_file(path)
     if "\t" in description:
         raise ValueError("Description cannot contain tab characters.")
 
+    val_bpb = f"{summary.val_bpb:.6f}" if summary is not None else ""
+    memory_gb = f"{summary.memory_gb:.1f}" if summary is not None else ""
+
     row = [
         commit,
-        f"{summary.val_bpb:.6f}",
-        f"{summary.memory_gb:.1f}",
+        val_bpb,
+        memory_gb,
         status,
         description,
     ]
@@ -181,10 +190,16 @@ def main() -> None:
         return
 
     if args.cmd == "append":
-        s = parse_run_log(args.log)
         commit = args.commit or get_short_commit()
+        s: RunSummary | None = None
+        if args.status != "crash":
+            s = parse_run_log(args.log)
+
         append_result(args.results, s, args.status, args.description, commit)
-        print(f"Appended {commit} | val_bpb={s.val_bpb:.6f} | mem={s.memory_gb:.1f} GB")
+        if s is None:
+            print(f"Appended {commit} | status=crash | metrics=unavailable")
+        else:
+            print(f"Appended {commit} | val_bpb={s.val_bpb:.6f} | mem={s.memory_gb:.1f} GB")
         return
 
     if args.cmd == "leaderboard":
