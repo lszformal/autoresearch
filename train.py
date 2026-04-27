@@ -433,6 +433,33 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
+
+def _env_bool(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean for {name}: {raw!r}")
+
+
+def _env_int(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else int(raw)
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else float(raw)
+
+
+def _env_str(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else raw
+
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
@@ -458,6 +485,29 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 USE_EMA = True           # evaluate an EMA-smoothed model at the end
 EMA_DECAY = 0.999        # closer to 1.0 = slower but smoother EMA updates
 EMA_WARMUP_STEPS = 20    # start EMA updates after this many optimizer steps
+SEED = 1337
+REPRO_MODE = False
+
+# Environment-variable overrides for sweeps and automation.
+ASPECT_RATIO = _env_int("AUTORESEARCH_ASPECT_RATIO", ASPECT_RATIO)
+HEAD_DIM = _env_int("AUTORESEARCH_HEAD_DIM", HEAD_DIM)
+WINDOW_PATTERN = _env_str("AUTORESEARCH_WINDOW_PATTERN", WINDOW_PATTERN)
+TOTAL_BATCH_SIZE = _env_int("AUTORESEARCH_TOTAL_BATCH_SIZE", TOTAL_BATCH_SIZE)
+EMBEDDING_LR = _env_float("AUTORESEARCH_EMBEDDING_LR", EMBEDDING_LR)
+UNEMBEDDING_LR = _env_float("AUTORESEARCH_UNEMBEDDING_LR", UNEMBEDDING_LR)
+MATRIX_LR = _env_float("AUTORESEARCH_MATRIX_LR", MATRIX_LR)
+SCALAR_LR = _env_float("AUTORESEARCH_SCALAR_LR", SCALAR_LR)
+WEIGHT_DECAY = _env_float("AUTORESEARCH_WEIGHT_DECAY", WEIGHT_DECAY)
+WARMUP_RATIO = _env_float("AUTORESEARCH_WARMUP_RATIO", WARMUP_RATIO)
+WARMDOWN_RATIO = _env_float("AUTORESEARCH_WARMDOWN_RATIO", WARMDOWN_RATIO)
+FINAL_LR_FRAC = _env_float("AUTORESEARCH_FINAL_LR_FRAC", FINAL_LR_FRAC)
+DEPTH = _env_int("AUTORESEARCH_DEPTH", DEPTH)
+DEVICE_BATCH_SIZE = _env_int("AUTORESEARCH_DEVICE_BATCH_SIZE", DEVICE_BATCH_SIZE)
+USE_EMA = _env_bool("AUTORESEARCH_USE_EMA", USE_EMA)
+EMA_DECAY = _env_float("AUTORESEARCH_EMA_DECAY", EMA_DECAY)
+EMA_WARMUP_STEPS = _env_int("AUTORESEARCH_EMA_WARMUP_STEPS", EMA_WARMUP_STEPS)
+SEED = _env_int("AUTORESEARCH_SEED", SEED)
+REPRO_MODE = _env_bool("AUTORESEARCH_REPRO_MODE", REPRO_MODE)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
