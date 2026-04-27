@@ -9,9 +9,15 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
+import json
 import math
+import random
+import re
+import subprocess
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -450,6 +456,84 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
+# Optional post-training reasoning phase (small math tasks with SFT + reward-weighted updates)
+REASONING_ENABLE = True
+REASONING_BUDGET_SECONDS = 30
+REASONING_SEQ_LEN = 128
+REASONING_SFT_BATCH_SIZE = 16
+REASONING_SFT_STEPS = 16
+REASONING_RL_STEPS = 16
+REASONING_RL_BATCH_SIZE = 8
+REASONING_RL_MAX_NEW_TOKENS = 40
+REASONING_LR_MULT = 0.25
+
+
+def _env_str(name, default):
+    return os.environ.get(name, default)
+
+
+def _env_int(name, default):
+    value = os.environ.get(name)
+    return int(value) if value is not None else default
+
+
+def _env_float(name, default):
+    value = os.environ.get(name)
+    return float(value) if value is not None else default
+
+
+def _env_betas(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    chunks = [x.strip() for x in value.split(",")]
+    if len(chunks) != 2:
+        raise ValueError(f"{name} must be formatted as 'beta1,beta2', got: {value!r}")
+    return (float(chunks[0]), float(chunks[1]))
+
+
+def _env_bool(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_git_commit():
+    """Best-effort current git commit for reproducibility metadata."""
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True, stderr=subprocess.DEVNULL)
+        return out.strip()
+    except Exception:
+        return "unknown"
+
+
+# Optional environment-based overrides for autonomous sweeps (no code edits required)
+ASPECT_RATIO = _env_int("AUTORESEARCH_ASPECT_RATIO", ASPECT_RATIO)
+HEAD_DIM = _env_int("AUTORESEARCH_HEAD_DIM", HEAD_DIM)
+WINDOW_PATTERN = _env_str("AUTORESEARCH_WINDOW_PATTERN", WINDOW_PATTERN)
+TOTAL_BATCH_SIZE = _env_int("AUTORESEARCH_TOTAL_BATCH_SIZE", TOTAL_BATCH_SIZE)
+EMBEDDING_LR = _env_float("AUTORESEARCH_EMBEDDING_LR", EMBEDDING_LR)
+UNEMBEDDING_LR = _env_float("AUTORESEARCH_UNEMBEDDING_LR", UNEMBEDDING_LR)
+MATRIX_LR = _env_float("AUTORESEARCH_MATRIX_LR", MATRIX_LR)
+SCALAR_LR = _env_float("AUTORESEARCH_SCALAR_LR", SCALAR_LR)
+WEIGHT_DECAY = _env_float("AUTORESEARCH_WEIGHT_DECAY", WEIGHT_DECAY)
+ADAM_BETAS = _env_betas("AUTORESEARCH_ADAM_BETAS", ADAM_BETAS)
+WARMUP_RATIO = _env_float("AUTORESEARCH_WARMUP_RATIO", WARMUP_RATIO)
+WARMDOWN_RATIO = _env_float("AUTORESEARCH_WARMDOWN_RATIO", WARMDOWN_RATIO)
+FINAL_LR_FRAC = _env_float("AUTORESEARCH_FINAL_LR_FRAC", FINAL_LR_FRAC)
+DEPTH = _env_int("AUTORESEARCH_DEPTH", DEPTH)
+DEVICE_BATCH_SIZE = _env_int("AUTORESEARCH_DEVICE_BATCH_SIZE", DEVICE_BATCH_SIZE)
+REASONING_ENABLE = _env_bool("AUTORESEARCH_REASONING_ENABLE", REASONING_ENABLE)
+REASONING_BUDGET_SECONDS = _env_int("AUTORESEARCH_REASONING_BUDGET_SECONDS", REASONING_BUDGET_SECONDS)
+REASONING_SEQ_LEN = _env_int("AUTORESEARCH_REASONING_SEQ_LEN", REASONING_SEQ_LEN)
+REASONING_SFT_BATCH_SIZE = _env_int("AUTORESEARCH_REASONING_SFT_BATCH_SIZE", REASONING_SFT_BATCH_SIZE)
+REASONING_SFT_STEPS = _env_int("AUTORESEARCH_REASONING_SFT_STEPS", REASONING_SFT_STEPS)
+REASONING_RL_STEPS = _env_int("AUTORESEARCH_REASONING_RL_STEPS", REASONING_RL_STEPS)
+REASONING_RL_BATCH_SIZE = _env_int("AUTORESEARCH_REASONING_RL_BATCH_SIZE", REASONING_RL_BATCH_SIZE)
+REASONING_RL_MAX_NEW_TOKENS = _env_int("AUTORESEARCH_REASONING_RL_MAX_NEW_TOKENS", REASONING_RL_MAX_NEW_TOKENS)
+REASONING_LR_MULT = _env_float("AUTORESEARCH_REASONING_LR_MULT", REASONING_LR_MULT)
+
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
@@ -465,6 +549,28 @@ H100_BF16_PEAK_FLOPS = 989.5e12
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
+print("Effective hyperparameters:")
+print(f"  DEPTH={DEPTH} ASPECT_RATIO={ASPECT_RATIO} HEAD_DIM={HEAD_DIM} WINDOW_PATTERN={WINDOW_PATTERN}")
+print(f"  TOTAL_BATCH_SIZE={TOTAL_BATCH_SIZE} DEVICE_BATCH_SIZE={DEVICE_BATCH_SIZE}")
+print(f"  EMBEDDING_LR={EMBEDDING_LR} UNEMBEDDING_LR={UNEMBEDDING_LR} MATRIX_LR={MATRIX_LR} SCALAR_LR={SCALAR_LR}")
+print(f"  WEIGHT_DECAY={WEIGHT_DECAY} ADAM_BETAS={ADAM_BETAS} WARMUP_RATIO={WARMUP_RATIO} WARMDOWN_RATIO={WARMDOWN_RATIO} FINAL_LR_FRAC={FINAL_LR_FRAC}")
+print(f"  REASONING_ENABLE={REASONING_ENABLE} REASONING_BUDGET_SECONDS={REASONING_BUDGET_SECONDS} REASONING_SFT_STEPS={REASONING_SFT_STEPS} REASONING_RL_STEPS={REASONING_RL_STEPS}")
+
+
+def save_run_summary(summary):
+    """Persist a machine-readable run summary for downstream research tooling."""
+    run_dir = Path(os.environ.get("AUTORESEARCH_RUN_DIR", "runs"))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    summary_path = run_dir / f"run_{ts}.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    latest_path = run_dir / "latest.json"
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"summary_json:     {summary_path}")
 
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
@@ -530,6 +636,155 @@ def get_muon_momentum(step):
 
 def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)
+
+
+def _sample_math_problem():
+    ops = ["+", "-", "*"]
+    op = random.choice(ops)
+    if op == "+":
+        a, b = random.randint(0, 999), random.randint(0, 999)
+        y = a + b
+    elif op == "-":
+        a, b = random.randint(0, 999), random.randint(0, 999)
+        y = a - b
+    else:
+        a, b = random.randint(0, 99), random.randint(0, 99)
+        y = a * b
+    return a, op, b, y
+
+
+def _reasoning_text(a, op, b, y):
+    return (
+        f"Question: {a} {op} {b}\n"
+        f"<think>{a} {op} {b} = {y}</think>\n"
+        f"Answer: {y}"
+    )
+
+
+def build_reasoning_sft_batch(tokenizer, batch_size, seq_len, device):
+    bos = tokenizer.get_bos_token_id()
+    xs = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
+    ys = torch.full((batch_size, seq_len), -1, dtype=torch.long, device=device)
+    for i in range(batch_size):
+        a, op, b, y = _sample_math_problem()
+        ids = tokenizer.encode(_reasoning_text(a, op, b, y), prepend=bos)
+        ids = ids[:seq_len + 1]
+        if len(ids) < 2:
+            continue
+        x_ids = ids[:-1]
+        y_ids = ids[1:]
+        n = min(len(x_ids), seq_len)
+        xs[i, :n] = torch.tensor(x_ids[:n], dtype=torch.long, device=device)
+        ys[i, :n] = torch.tensor(y_ids[:n], dtype=torch.long, device=device)
+    return xs, ys
+
+
+def _parse_answer(text):
+    m = re.search(r"Answer:\s*(-?\d+)", text)
+    if m is None:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+@torch.no_grad()
+def _sample_sequence(model, tokenizer, prompt_ids, max_new_tokens):
+    ids = prompt_ids[:]
+    for _ in range(max_new_tokens):
+        x = torch.tensor([ids], dtype=torch.long, device=device)
+        with autocast_ctx:
+            logits = model(x)
+        next_logits = logits[0, -1]
+        probs = F.softmax(next_logits, dim=-1)
+        next_id = torch.multinomial(probs, num_samples=1).item()
+        ids.append(next_id)
+        if next_id == tokenizer.get_bos_token_id():
+            break
+    return ids
+
+
+def _logprob_for_generated_tokens(model, full_ids, prompt_len):
+    x = torch.tensor([full_ids[:-1]], dtype=torch.long, device=device)
+    y = torch.tensor([full_ids[1:]], dtype=torch.long, device=device)
+    with autocast_ctx:
+        logits = model(x)
+    log_probs = F.log_softmax(logits, dim=-1)
+    selected = log_probs.gather(-1, y.unsqueeze(-1)).squeeze(-1)
+    generated = selected[:, prompt_len - 1:]
+    return generated.sum()
+
+
+def run_reasoning_phase(model, optimizer, tokenizer):
+    if not REASONING_ENABLE or REASONING_BUDGET_SECONDS <= 0:
+        return {"enabled": False}
+
+    print("\n---")
+    print("Starting reasoning phase (SFT + reward-weighted fine-tuning)")
+    t0 = time.time()
+    for group in optimizer.param_groups:
+        group["lr"] = group["initial_lr"] * REASONING_LR_MULT
+
+    sft_steps_done = 0
+    for _ in range(REASONING_SFT_STEPS):
+        if time.time() - t0 >= REASONING_BUDGET_SECONDS:
+            break
+        x_sft, y_sft = build_reasoning_sft_batch(tokenizer, REASONING_SFT_BATCH_SIZE, REASONING_SEQ_LEN, device)
+        with autocast_ctx:
+            sft_loss = model(x_sft, y_sft)
+        sft_loss.backward()
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+        sft_steps_done += 1
+
+    rl_steps_done = 0
+    reward_sum = 0.0
+    accuracy_sum = 0.0
+    for _ in range(REASONING_RL_STEPS):
+        if time.time() - t0 >= REASONING_BUDGET_SECONDS:
+            break
+        batch_items = []
+        rewards = []
+        for _ in range(REASONING_RL_BATCH_SIZE):
+            a, op, b, y = _sample_math_problem()
+            prompt = f"Question: {a} {op} {b}\n<think>"
+            prompt_ids = tokenizer.encode(prompt, prepend=tokenizer.get_bos_token_id())
+            sampled_ids = _sample_sequence(model, tokenizer, prompt_ids, REASONING_RL_MAX_NEW_TOKENS)
+            text = tokenizer.decode(sampled_ids)
+            parsed = _parse_answer(text)
+            correct = parsed == y
+            reward = 1.0 if correct else -1.0
+            rewards.append(reward)
+            batch_items.append((sampled_ids, len(prompt_ids)))
+            reward_sum += reward
+            accuracy_sum += 1.0 if correct else 0.0
+
+        reward_baseline = sum(rewards) / max(len(rewards), 1)
+        rl_loss = torch.tensor(0.0, device=device)
+        for (ids, prompt_len), reward in zip(batch_items, rewards):
+            advantage = reward - reward_baseline
+            logp = _logprob_for_generated_tokens(model, ids, prompt_len)
+            rl_loss = rl_loss + (-advantage * logp)
+        rl_loss = rl_loss / max(len(batch_items), 1)
+        rl_loss.backward()
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+        rl_steps_done += 1
+
+    elapsed = time.time() - t0
+    count = rl_steps_done * REASONING_RL_BATCH_SIZE
+    rl_accuracy = (accuracy_sum / count) if count > 0 else 0.0
+    avg_reward = (reward_sum / count) if count > 0 else 0.0
+    print(f"Reasoning phase done in {elapsed:.1f}s | sft_steps={sft_steps_done} rl_steps={rl_steps_done} rl_accuracy={rl_accuracy:.3f} avg_reward={avg_reward:.3f}")
+    return {
+        "enabled": True,
+        "elapsed_seconds": float(elapsed),
+        "sft_steps": int(sft_steps_done),
+        "rl_steps": int(rl_steps_done),
+        "rl_accuracy": float(rl_accuracy),
+        "avg_reward": float(avg_reward),
+    }
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -607,6 +862,8 @@ print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
+reasoning_stats = run_reasoning_phase(model, optimizer, tokenizer)
+
 # Final eval
 model.eval()
 with autocast_ctx:
@@ -628,3 +885,50 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+run_summary = {
+    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    "git_commit": _safe_git_commit(),
+    "metrics": {
+        "val_bpb": float(val_bpb),
+        "training_seconds": float(total_training_time),
+        "total_seconds": float(t_end - t_start),
+        "peak_vram_mb": float(peak_vram_mb),
+        "mfu_percent": float(steady_state_mfu),
+        "total_tokens_M": float(total_tokens / 1e6),
+        "num_steps": int(step),
+    },
+    "model": {
+        "num_params_M": float(num_params / 1e6),
+        "depth": int(DEPTH),
+        "aspect_ratio": int(ASPECT_RATIO),
+        "head_dim": int(HEAD_DIM),
+        "window_pattern": WINDOW_PATTERN,
+    },
+    "optimization": {
+        "total_batch_size": int(TOTAL_BATCH_SIZE),
+        "device_batch_size": int(DEVICE_BATCH_SIZE),
+        "embedding_lr": float(EMBEDDING_LR),
+        "unembedding_lr": float(UNEMBEDDING_LR),
+        "matrix_lr": float(MATRIX_LR),
+        "scalar_lr": float(SCALAR_LR),
+        "weight_decay": float(WEIGHT_DECAY),
+        "adam_betas": list(ADAM_BETAS),
+        "warmup_ratio": float(WARMUP_RATIO),
+        "warmdown_ratio": float(WARMDOWN_RATIO),
+        "final_lr_frac": float(FINAL_LR_FRAC),
+    },
+    "reasoning": {
+        "enabled": bool(REASONING_ENABLE),
+        "budget_seconds": int(REASONING_BUDGET_SECONDS),
+        "seq_len": int(REASONING_SEQ_LEN),
+        "sft_batch_size": int(REASONING_SFT_BATCH_SIZE),
+        "sft_steps_target": int(REASONING_SFT_STEPS),
+        "rl_steps_target": int(REASONING_RL_STEPS),
+        "rl_batch_size": int(REASONING_RL_BATCH_SIZE),
+        "rl_max_new_tokens": int(REASONING_RL_MAX_NEW_TOKENS),
+        "lr_mult": float(REASONING_LR_MULT),
+        "stats": reasoning_stats,
+    },
+}
+save_run_summary(run_summary)
