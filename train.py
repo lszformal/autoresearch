@@ -11,6 +11,7 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import gc
 import json
 import math
+import socket
 import subprocess
 import time
 from dataclasses import dataclass, asdict
@@ -615,6 +616,48 @@ def restore_model_params(model, backups):
         if name in backups:
             p.copy_(backups[name])
 
+
+def save_run_summary(summary):
+    """Persist a machine-readable run summary for downstream research tooling."""
+    run_dir = Path(os.environ.get("AUTORESEARCH_RUN_DIR", "runs"))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    ts = ts.replace(".", "_")
+    summary_path = run_dir / f"run_{ts}.json"
+    with open(summary_path, "x", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    latest_path = run_dir / "latest.json"
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    history_path = run_dir / "history.jsonl"
+    with open(history_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(summary, sort_keys=True))
+        f.write("\n")
+    print(f"summary_json:     {summary_path}")
+
+
+def get_git_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except subprocess.SubprocessError:
+        return None
+
+
+def get_hardware_info():
+    name = torch.cuda.get_device_name(0)
+    cap = torch.cuda.get_device_capability(0)
+    return {
+        "cuda_device_name": name,
+        "cuda_capability": f"{cap[0]}.{cap[1]}",
+        "hostname": socket.gethostname(),
+    }
+
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
@@ -856,10 +899,9 @@ print(f"depth:            {DEPTH}")
 
 run_summary = {
     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    "git_commit": get_git_commit(),
     "metrics": {
         "val_bpb": float(val_bpb),
-        "val_bpb_raw": float(val_bpb_raw),
-        "val_bpb_ema": float(val_bpb_ema) if val_bpb_ema is not None else None,
         "training_seconds": float(total_training_time),
         "total_seconds": float(t_end - t_start),
         "peak_vram_mb": float(peak_vram_mb),
@@ -886,11 +928,11 @@ run_summary = {
         "warmup_ratio": float(WARMUP_RATIO),
         "warmdown_ratio": float(WARMDOWN_RATIO),
         "final_lr_frac": float(FINAL_LR_FRAC),
-        "use_ema": bool(USE_EMA),
-        "ema_decay": float(EMA_DECAY),
-        "ema_warmup_steps": int(EMA_WARMUP_STEPS),
-        "ema_updates": int(ema_updates),
     },
+    "runtime": {
+        "seed": 42,
+        "startup_seconds": float(startup_time),
+    },
+    "hardware": get_hardware_info(),
 }
 save_run_summary(run_summary)
-maybe_write_run_artifacts(summary)

@@ -101,9 +101,9 @@ Each `uv run train.py` execution now writes a machine-readable JSON summary to `
 
 - `runs/run_<timestamp>.json` — immutable summary for a specific run.
 - `runs/latest.json` — summary for the most recent run.
+- `runs/history.jsonl` — append-only line-delimited history for fast ingestion.
 
 This makes it easier for autonomous agents to compare experiments without brittle log parsing.
-The summary now also stores both `val_bpb_raw` and `val_bpb_ema` (if EMA is enabled), while `val_bpb` is the selected best of the two.
 
 You can analyze the best runs with:
 
@@ -111,9 +111,11 @@ You can analyze the best runs with:
 uv run analyze_runs.py
 uv run analyze_runs.py --limit 20
 uv run analyze_runs.py --json
+uv run analyze_runs.py --newest
 ```
 
 By default, summaries are written to `./runs`; override with `AUTORESEARCH_RUN_DIR=/path/to/runs`.
+Run summaries now also include `git_commit`, hardware metadata (GPU model + capability), and startup/runtime fields to improve reproducibility audits across machines.
 
 ## Design choices
 

@@ -16,13 +16,15 @@ def load_runs(run_dir: Path):
     for path in sorted(run_dir.glob("run_*.json")):
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
+        if "metrics" not in payload or "val_bpb" not in payload["metrics"]:
+            continue
         payload["_path"] = str(path)
         runs.append(payload)
     return runs
 
 
 def print_table(rows):
-    headers = ["rank", "val_bpb", "raw", "ema", "steps", "mfu%", "tokens_M", "depth", "window", "file"]
+    headers = ["rank", "val_bpb", "delta_best%", "steps", "mfu%", "gpu", "depth", "window", "file"]
     widths = [len(h) for h in headers]
     for row in rows:
         for i, col in enumerate(row):
@@ -40,6 +42,7 @@ def main():
     parser.add_argument("--run-dir", default="runs", help="Directory containing run_*.json files.")
     parser.add_argument("--limit", type=int, default=10, help="How many top runs to print.")
     parser.add_argument("--json", action="store_true", help="Print top runs in JSON format.")
+    parser.add_argument("--newest", action="store_true", help="Sort by newest timestamp instead of val_bpb.")
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -50,8 +53,12 @@ def main():
     if not runs:
         raise SystemExit(f"No run_*.json files found in {run_dir}")
 
-    ranked = sorted(runs, key=lambda r: r["metrics"]["val_bpb"])
+    if args.newest:
+        ranked = sorted(runs, key=lambda r: r.get("timestamp_utc", ""), reverse=True)
+    else:
+        ranked = sorted(runs, key=lambda r: r["metrics"]["val_bpb"])
     top = ranked[: args.limit]
+    best_bpb = min(r["metrics"]["val_bpb"] for r in runs)
 
     if args.json:
         print(json.dumps(top, indent=2))
@@ -64,11 +71,10 @@ def main():
         rows.append([
             str(rank),
             f'{metrics["val_bpb"]:.6f}',
-            f'{metrics.get("val_bpb_raw", metrics["val_bpb"]):.6f}',
-            f'{metrics["val_bpb_ema"]:.6f}' if metrics.get("val_bpb_ema") is not None else "n/a",
+            f'{100 * (metrics["val_bpb"] / best_bpb - 1):+.2f}',
             str(metrics["num_steps"]),
             f'{metrics["mfu_percent"]:.2f}',
-            f'{metrics["total_tokens_M"]:.1f}',
+            run.get("hardware", {}).get("cuda_device_name", "unknown"),
             str(model["depth"]),
             str(model["window_pattern"]),
             Path(run["_path"]).name,
