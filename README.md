@@ -55,8 +55,37 @@ The `program.md` file is essentially a super lightweight "skill".
 prepare.py      — constants, data prep + runtime utilities (do not modify)
 train.py        — model, optimizer, training loop (agent modifies this)
 program.md      — agent instructions
+analyze_runs.py — leaderboard utility for JSON run summaries
 pyproject.toml  — dependencies
 ```
+
+## Experiment tracking and analysis
+
+Each `uv run train.py` execution now writes a machine-readable JSON summary to `runs/`:
+
+- `runs/run_<timestamp>_<pid>.json` — immutable summary for a specific run.
+- `runs/latest.json` — summary for the most recent run.
+
+The summary includes:
+
+- core metrics (`val_bpb`, startup/training/total seconds, peak VRAM, MFU, token throughput proxy),
+- model shape and optimization hyperparameters,
+- run metadata (`git_commit`, host, Python/Torch versions, CUDA device),
+- schema versioning (`schema_version`) for forward-compatible tooling.
+
+This makes it easier for autonomous agents to compare experiments without brittle log parsing and to trace results back to exact code snapshots.
+
+You can analyze the best runs with:
+
+```bash
+uv run analyze_runs.py
+uv run analyze_runs.py --limit 20
+uv run analyze_runs.py --json
+```
+
+The analyzer also prints best-vs-latest delta and tolerates malformed JSON artifacts by skipping invalid files with a warning.
+
+By default, summaries are written to `./runs`; override with `AUTORESEARCH_RUN_DIR=/path/to/runs`.
 
 ## Design choices
 
