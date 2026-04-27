@@ -1,118 +1,216 @@
-"""Summarize autoresearch experiment logs from results.tsv.
+"""
+Utilities for autonomous experiment bookkeeping.
 
-Usage:
-    uv run python analyze_results.py
-    uv run python analyze_results.py --path results.tsv --top 5
+Features:
+- Parse training summary metrics from a run log.
+- Append a new row to results.tsv with consistent formatting.
+- Print a compact leaderboard and trend stats from existing results.tsv.
+
+Examples:
+    uv run analyze_results.py parse --log run.log
+    uv run analyze_results.py append --log run.log --description "baseline" --status keep
+    uv run analyze_results.py leaderboard --top 10
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import mean
+from typing import Iterable
+
+RESULTS_HEADER = ["commit", "val_bpb", "memory_gb", "status", "description"]
+SUMMARY_KEYS = ("val_bpb", "peak_vram_mb", "training_seconds", "num_steps")
 
 
 @dataclass
-class ResultRow:
-    commit: str
+class RunSummary:
     val_bpb: float
-    memory_gb: float
-    status: str
-    description: str
+    peak_vram_mb: float
+    training_seconds: float | None = None
+    num_steps: int | None = None
+
+    @property
+    def memory_gb(self) -> float:
+        return round(self.peak_vram_mb / 1024.0, 1)
 
 
-def load_results(path: Path) -> list[ResultRow]:
+def parse_run_log(log_path: Path) -> RunSummary:
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    values: dict[str, str] = {}
+    for key in SUMMARY_KEYS:
+        m = re.search(rf"^{re.escape(key)}:\s*([^\n]+)$", text, flags=re.MULTILINE)
+        if m:
+            values[key] = m.group(1).strip()
+
+    if "val_bpb" not in values or "peak_vram_mb" not in values:
+        raise ValueError(
+            f"Could not find required keys in {log_path}: val_bpb and peak_vram_mb."
+        )
+
+    return RunSummary(
+        val_bpb=float(values["val_bpb"]),
+        peak_vram_mb=float(values["peak_vram_mb"]),
+        training_seconds=float(values["training_seconds"]) if "training_seconds" in values else None,
+        num_steps=int(float(values["num_steps"])) if "num_steps" in values else None,
+    )
+
+
+def get_short_commit() -> str:
+    proc = subprocess.run(
+        ["git", "rev-parse", "--short=7", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout.strip()
+
+
+def ensure_results_file(path: Path) -> None:
     if not path.exists():
-        raise FileNotFoundError(f"Results file not found: {path}")
+        path.write_text("\t".join(RESULTS_HEADER) + "\n", encoding="utf-8")
+        return
 
-    rows: list[ResultRow] = []
+    first_line = path.read_text(encoding="utf-8").splitlines()[:1]
+    header = first_line[0].split("\t") if first_line else []
+    if header != RESULTS_HEADER:
+        raise ValueError(
+            f"Unexpected header in {path}: {header!r} (expected {RESULTS_HEADER!r})"
+        )
+
+
+def append_result(
+    path: Path,
+    summary: RunSummary | None,
+    status: str,
+    description: str,
+    commit: str,
+) -> None:
+    ensure_results_file(path)
+    if "\t" in description:
+        raise ValueError("Description cannot contain tab characters.")
+
+    val_bpb = f"{summary.val_bpb:.6f}" if summary is not None else ""
+    memory_gb = f"{summary.memory_gb:.1f}" if summary is not None else ""
+
+    row = [
+        commit,
+        val_bpb,
+        memory_gb,
+        status,
+        description,
+    ]
+    with path.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, delimiter="\t")
+        writer.writerow(row)
+
+
+def read_results(path: Path) -> list[dict[str, str]]:
+    ensure_results_file(path)
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
-        expected = {"commit", "val_bpb", "memory_gb", "status", "description"}
-        if not reader.fieldnames or set(reader.fieldnames) != expected:
-            raise ValueError(
-                "results.tsv has unexpected columns. "
-                f"Expected {sorted(expected)}, got {reader.fieldnames}"
-            )
-
-        for row in reader:
-            rows.append(
-                ResultRow(
-                    commit=row["commit"],
-                    val_bpb=float(row["val_bpb"]),
-                    memory_gb=float(row["memory_gb"]),
-                    status=row["status"].strip().lower(),
-                    description=row["description"].strip(),
-                )
-            )
+        rows = list(reader)
     return rows
 
 
-def summarize(rows: list[ResultRow], top_n: int) -> str:
+def fmt_rows(rows: Iterable[dict[str, str]]) -> str:
+    rows = list(rows)
     if not rows:
-        return "No experiment rows found in results.tsv yet."
-
-    keeps = [r for r in rows if r.status == "keep"]
-    discards = [r for r in rows if r.status == "discard"]
-    crashes = [r for r in rows if r.status == "crash"]
-
-    lines: list[str] = []
-    lines.append(f"Total experiments: {len(rows)}")
-    lines.append(
-        "Status counts: "
-        f"keep={len(keeps)}, discard={len(discards)}, crash={len(crashes)}"
-    )
-
-    if crashes:
-        crash_rate = len(crashes) / len(rows)
-        lines.append(f"Crash rate: {crash_rate:.1%}")
-
-    successful = [r for r in rows if r.status in {"keep", "discard"} and r.val_bpb > 0]
-    if successful:
-        best = min(successful, key=lambda r: r.val_bpb)
-        avg_bpb = mean(r.val_bpb for r in successful)
-        avg_mem = mean(r.memory_gb for r in successful)
-        lines.append(
-            f"Best val_bpb: {best.val_bpb:.6f} ({best.commit}, {best.description})"
-        )
-        lines.append(f"Average val_bpb (non-crash): {avg_bpb:.6f}")
-        lines.append(f"Average memory_gb (non-crash): {avg_mem:.1f}")
-
-        ranked = sorted(successful, key=lambda r: r.val_bpb)[:top_n]
-        lines.append("")
-        lines.append(f"Top {len(ranked)} runs by val_bpb:")
-        for i, r in enumerate(ranked, start=1):
-            lines.append(
-                f"{i:>2}. {r.val_bpb:.6f} | {r.memory_gb:>4.1f} GB | {r.status:<7} "
-                f"| {r.commit} | {r.description}"
-            )
-
+        return "(no rows)"
+    cols = RESULTS_HEADER
+    widths = {c: max(len(c), *(len(str(r.get(c, ""))) for r in rows)) for c in cols}
+    lines = []
+    lines.append("  ".join(c.ljust(widths[c]) for c in cols))
+    lines.append("  ".join("-" * widths[c] for c in cols))
+    for r in rows:
+        lines.append("  ".join(str(r.get(c, "")).ljust(widths[c]) for c in cols))
     return "\n".join(lines)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--path",
-        type=Path,
-        default=Path("results.tsv"),
-        help="Path to tab-separated results file (default: results.tsv)",
+def leaderboard(path: Path, top: int) -> str:
+    rows = [r for r in read_results(path) if r.get("status") == "keep"]
+    rows.sort(key=lambda r: float(r["val_bpb"]))
+    return fmt_rows(rows[:top])
+
+
+def trend(path: Path) -> str:
+    rows = [r for r in read_results(path) if r.get("status") == "keep"]
+    if not rows:
+        return "No kept runs yet."
+
+    best = min(rows, key=lambda r: float(r["val_bpb"]))
+    first = rows[0]
+    delta = float(best["val_bpb"]) - float(first["val_bpb"])
+    direction = "improved" if delta < 0 else "worsened"
+    return (
+        f"kept_runs={len(rows)} | best={best['val_bpb']} ({best['commit']}) | "
+        f"start={first['val_bpb']} -> {direction} by {delta:.6f} bpb"
     )
-    parser.add_argument(
-        "--top",
-        type=int,
-        default=10,
-        help="Number of best runs to print (default: 10)",
-    )
-    return parser.parse_args()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Autoresearch results utilities")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_parse = sub.add_parser("parse", help="Parse summary metrics from a log")
+    p_parse.add_argument("--log", type=Path, default=Path("run.log"))
+
+    p_append = sub.add_parser("append", help="Append one run to results.tsv")
+    p_append.add_argument("--log", type=Path, default=Path("run.log"))
+    p_append.add_argument("--results", type=Path, default=Path("results.tsv"))
+    p_append.add_argument("--status", choices=["keep", "discard", "crash"], required=True)
+    p_append.add_argument("--description", required=True)
+    p_append.add_argument("--commit", default=None, help="Defaults to current HEAD short hash")
+
+    p_lead = sub.add_parser("leaderboard", help="Print best kept runs")
+    p_lead.add_argument("--results", type=Path, default=Path("results.tsv"))
+    p_lead.add_argument("--top", type=int, default=10)
+
+    p_trend = sub.add_parser("trend", help="Print trend summary over kept runs")
+    p_trend.add_argument("--results", type=Path, default=Path("results.tsv"))
+
+    return p
 
 
 def main() -> None:
-    args = parse_args()
-    rows = load_results(args.path)
-    print(summarize(rows, top_n=max(1, args.top)))
+    args = build_parser().parse_args()
+
+    if args.cmd == "parse":
+        s = parse_run_log(args.log)
+        print(f"val_bpb={s.val_bpb:.6f}")
+        print(f"peak_vram_mb={s.peak_vram_mb:.1f}")
+        print(f"memory_gb={s.memory_gb:.1f}")
+        if s.training_seconds is not None:
+            print(f"training_seconds={s.training_seconds:.1f}")
+        if s.num_steps is not None:
+            print(f"num_steps={s.num_steps}")
+        return
+
+    if args.cmd == "append":
+        commit = args.commit or get_short_commit()
+        s: RunSummary | None = None
+        if args.status != "crash":
+            s = parse_run_log(args.log)
+
+        append_result(args.results, s, args.status, args.description, commit)
+        if s is None:
+            print(f"Appended {commit} | status=crash | metrics=unavailable")
+        else:
+            print(f"Appended {commit} | val_bpb={s.val_bpb:.6f} | mem={s.memory_gb:.1f} GB")
+        return
+
+    if args.cmd == "leaderboard":
+        print(leaderboard(args.results, args.top))
+        return
+
+    if args.cmd == "trend":
+        print(trend(args.results))
+        return
+
+    raise RuntimeError(f"Unhandled command: {args.cmd}")
 
 
 if __name__ == "__main__":
