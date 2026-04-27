@@ -36,13 +36,16 @@ def print_table(rows):
 
 
 def to_json_safe_runs(runs):
-    json_safe = []
-    for run in runs:
-        item = dict(run)
-        if "_path" in item:
-            item["_path"] = str(item["_path"])
-        json_safe.append(item)
-    return json_safe
+    def convert(value):
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {k: convert(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [convert(v) for v in value]
+        return value
+
+    return [convert(run) for run in runs]
 
 
 def main():
