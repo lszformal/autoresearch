@@ -16,21 +16,13 @@ def load_runs(run_dir: Path):
     for path in sorted(run_dir.glob("run_*.json")):
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
-        payload["_path"] = path
+        payload["_path"] = str(path)
         runs.append(payload)
     return runs
 
 
-def to_json_safe_run(run: dict) -> dict:
-    """Return a copy of run payload that can be serialized to JSON."""
-    json_safe = dict(run)
-    if "_path" in json_safe:
-        json_safe["_path"] = str(json_safe["_path"])
-    return json_safe
-
-
 def print_table(rows):
-    headers = ["rank", "val_bpb", "steps", "mfu%", "tokens_M", "depth", "window", "commit", "file"]
+    headers = ["rank", "val_bpb", "raw", "ema", "steps", "mfu%", "tokens_M", "depth", "window", "file"]
     widths = [len(h) for h in headers]
     for row in rows:
         for i, col in enumerate(row):
@@ -62,7 +54,7 @@ def main():
     top = ranked[: args.limit]
 
     if args.json:
-        print(json.dumps([to_json_safe_run(run) for run in top], indent=2))
+        print(json.dumps(top, indent=2))
         return
 
     rows = []
@@ -72,13 +64,14 @@ def main():
         rows.append([
             str(rank),
             f'{metrics["val_bpb"]:.6f}',
+            f'{metrics.get("val_bpb_raw", metrics["val_bpb"]):.6f}',
+            f'{metrics["val_bpb_ema"]:.6f}' if metrics.get("val_bpb_ema") is not None else "n/a",
             str(metrics["num_steps"]),
             f'{metrics["mfu_percent"]:.2f}',
             f'{metrics["total_tokens_M"]:.1f}',
             str(model["depth"]),
             str(model["window_pattern"]),
-            str(run.get("git_commit", "unknown")),
-            run["_path"].name,
+            Path(run["_path"]).name,
         ])
 
     print(f"Loaded {len(runs)} runs from {run_dir}")

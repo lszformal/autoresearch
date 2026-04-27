@@ -433,6 +433,33 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
+
+def _env_bool(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean for {name}: {raw!r}")
+
+
+def _env_int(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else int(raw)
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else float(raw)
+
+
+def _env_str(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else raw
+
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
@@ -454,57 +481,14 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
-# Reproducibility
-SEED = 1337             # RNG seed for torch CPU/CUDA
-REPRO_MODE = False      # deterministic mode (slower, stricter kernels)
+# Evaluation / stability
+USE_EMA = True           # evaluate an EMA-smoothed model at the end
+EMA_DECAY = 0.999        # closer to 1.0 = slower but smoother EMA updates
+EMA_WARMUP_STEPS = 20    # start EMA updates after this many optimizer steps
+SEED = 1337
+REPRO_MODE = False
 
-
-def _env_str(name, default):
-    return os.environ.get(name, default)
-
-
-def _env_int(name, default):
-    value = os.environ.get(name)
-    return int(value) if value is not None else default
-
-
-def _env_float(name, default):
-    value = os.environ.get(name)
-    return float(value) if value is not None else default
-
-
-def _env_bool(name, default):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{name} must be a boolean-like value, got: {value!r}")
-
-
-def _env_betas(name, default):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    chunks = [x.strip() for x in value.split(",")]
-    if len(chunks) != 2:
-        raise ValueError(f"{name} must be formatted as 'beta1,beta2', got: {value!r}")
-    return (float(chunks[0]), float(chunks[1]))
-
-
-def _safe_git_commit():
-    """Best-effort current git commit for reproducibility metadata."""
-    try:
-        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True, stderr=subprocess.DEVNULL)
-        return out.strip()
-    except Exception:
-        return "unknown"
-
-
-# Optional environment-based overrides for autonomous sweeps (no code edits required)
+# Environment-variable overrides for sweeps and automation.
 ASPECT_RATIO = _env_int("AUTORESEARCH_ASPECT_RATIO", ASPECT_RATIO)
 HEAD_DIM = _env_int("AUTORESEARCH_HEAD_DIM", HEAD_DIM)
 WINDOW_PATTERN = _env_str("AUTORESEARCH_WINDOW_PATTERN", WINDOW_PATTERN)
@@ -514,12 +498,14 @@ UNEMBEDDING_LR = _env_float("AUTORESEARCH_UNEMBEDDING_LR", UNEMBEDDING_LR)
 MATRIX_LR = _env_float("AUTORESEARCH_MATRIX_LR", MATRIX_LR)
 SCALAR_LR = _env_float("AUTORESEARCH_SCALAR_LR", SCALAR_LR)
 WEIGHT_DECAY = _env_float("AUTORESEARCH_WEIGHT_DECAY", WEIGHT_DECAY)
-ADAM_BETAS = _env_betas("AUTORESEARCH_ADAM_BETAS", ADAM_BETAS)
 WARMUP_RATIO = _env_float("AUTORESEARCH_WARMUP_RATIO", WARMUP_RATIO)
 WARMDOWN_RATIO = _env_float("AUTORESEARCH_WARMDOWN_RATIO", WARMDOWN_RATIO)
 FINAL_LR_FRAC = _env_float("AUTORESEARCH_FINAL_LR_FRAC", FINAL_LR_FRAC)
 DEPTH = _env_int("AUTORESEARCH_DEPTH", DEPTH)
 DEVICE_BATCH_SIZE = _env_int("AUTORESEARCH_DEVICE_BATCH_SIZE", DEVICE_BATCH_SIZE)
+USE_EMA = _env_bool("AUTORESEARCH_USE_EMA", USE_EMA)
+EMA_DECAY = _env_float("AUTORESEARCH_EMA_DECAY", EMA_DECAY)
+EMA_WARMUP_STEPS = _env_int("AUTORESEARCH_EMA_WARMUP_STEPS", EMA_WARMUP_STEPS)
 SEED = _env_int("AUTORESEARCH_SEED", SEED)
 REPRO_MODE = _env_bool("AUTORESEARCH_REPRO_MODE", REPRO_MODE)
 
@@ -579,6 +565,55 @@ def save_run_summary(summary):
         json.dump(summary, f, indent=2, sort_keys=True)
         f.write("\n")
     print(f"summary_json:     {summary_path}")
+
+
+def save_run_summary(summary):
+    """Persist a machine-readable run summary for downstream research tooling."""
+    run_dir = Path(os.environ.get("AUTORESEARCH_RUN_DIR", "runs"))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    summary_path = run_dir / f"run_{ts}.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    latest_path = run_dir / "latest.json"
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"summary_json:     {summary_path}")
+
+
+@torch.no_grad()
+def init_ema_state(model):
+    return {
+        name: p.detach().float().clone()
+        for name, p in model.named_parameters()
+        if p.requires_grad and p.is_floating_point()
+    }
+
+
+@torch.no_grad()
+def update_ema_state(model, ema_state, decay):
+    for name, p in model.named_parameters():
+        if name in ema_state:
+            ema_state[name].lerp_(p.detach().float(), 1 - decay)
+
+
+@torch.no_grad()
+def copy_ema_to_model(model, ema_state):
+    backups = {}
+    for name, p in model.named_parameters():
+        if name in ema_state:
+            backups[name] = p.detach().clone()
+            p.copy_(ema_state[name].to(device=p.device, dtype=p.dtype))
+    return backups
+
+
+@torch.no_grad()
+def restore_model_params(model, backups):
+    for name, p in model.named_parameters():
+        if name in backups:
+            p.copy_(backups[name])
 
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
@@ -648,6 +683,8 @@ model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
+ema_state = init_ema_state(model) if USE_EMA else None
+ema_updates = 0
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -702,6 +739,9 @@ while True:
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    if ema_state is not None and step >= EMA_WARMUP_STEPS:
+        update_ema_state(model, ema_state, EMA_DECAY)
+        ema_updates += 1
 
     train_loss_f = train_loss.item()
 
@@ -749,7 +789,14 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb_raw = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+val_bpb_ema = None
+if ema_state is not None and ema_updates > 0:
+    backups = copy_ema_to_model(model, ema_state)
+    with autocast_ctx:
+        val_bpb_ema = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    restore_model_params(model, backups)
+val_bpb = min(val_bpb_raw, val_bpb_ema) if val_bpb_ema is not None else val_bpb_raw
 
 # Final summary
 t_end = time.time()
@@ -796,6 +843,8 @@ summary = {
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
+print(f"val_bpb_raw:      {val_bpb_raw:.6f}")
+print(f"val_bpb_ema:      {val_bpb_ema:.6f}" if val_bpb_ema is not None else "val_bpb_ema:      n/a")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
@@ -807,9 +856,10 @@ print(f"depth:            {DEPTH}")
 
 run_summary = {
     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-    "git_commit": _safe_git_commit(),
     "metrics": {
         "val_bpb": float(val_bpb),
+        "val_bpb_raw": float(val_bpb_raw),
+        "val_bpb_ema": float(val_bpb_ema) if val_bpb_ema is not None else None,
         "training_seconds": float(total_training_time),
         "total_seconds": float(t_end - t_start),
         "peak_vram_mb": float(peak_vram_mb),
@@ -836,6 +886,10 @@ run_summary = {
         "warmup_ratio": float(WARMUP_RATIO),
         "warmdown_ratio": float(WARMDOWN_RATIO),
         "final_lr_frac": float(FINAL_LR_FRAC),
+        "use_ema": bool(USE_EMA),
+        "ema_decay": float(EMA_DECAY),
+        "ema_warmup_steps": int(EMA_WARMUP_STEPS),
+        "ema_updates": int(ema_updates),
     },
 }
 save_run_summary(run_summary)
