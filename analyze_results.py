@@ -192,7 +192,9 @@ def main() -> None:
     if args.cmd == "append":
         commit = args.commit or get_short_commit()
         s: RunSummary | None = None
-        if args.status != "crash":
+
+        # Crash rows must be appendable even when run.log only contains traceback text.
+        if args.status in {"keep", "discard"}:
             s = parse_run_log(args.log)
 
         append_result(args.results, s, args.status, args.description, commit)
