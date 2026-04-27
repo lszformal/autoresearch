@@ -21,6 +21,14 @@ def load_runs(run_dir: Path):
     return runs
 
 
+def to_json_safe_run(run: dict) -> dict:
+    """Return a copy of run payload that can be serialized to JSON."""
+    json_safe = dict(run)
+    if "_path" in json_safe:
+        json_safe["_path"] = str(json_safe["_path"])
+    return json_safe
+
+
 def print_table(rows):
     headers = ["rank", "val_bpb", "steps", "mfu%", "tokens_M", "depth", "window", "commit", "file"]
     widths = [len(h) for h in headers]
@@ -54,7 +62,7 @@ def main():
     top = ranked[: args.limit]
 
     if args.json:
-        print(json.dumps(top, indent=2))
+        print(json.dumps([to_json_safe_run(run) for run in top], indent=2))
         return
 
     rows = []
