@@ -13,10 +13,13 @@ import json
 import math
 import socket
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
+import platform
+import subprocess
 
 import torch
 import torch.nn as nn
@@ -658,6 +661,47 @@ def get_hardware_info():
         "hostname": socket.gethostname(),
     }
 
+
+def save_run_summary(summary):
+    """Persist a machine-readable run summary for downstream research tooling."""
+    run_dir = Path(os.environ.get("AUTORESEARCH_RUN_DIR", "runs"))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_id = summary["run"]["run_id"]
+    summary_path = run_dir / f"run_{run_id}.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    latest_path = run_dir / "latest.json"
+    latest_tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=run_dir,
+            prefix=".latest.",
+            suffix=".json.tmp",
+            delete=False,
+        ) as f:
+            latest_tmp_path = Path(f.name)
+            json.dump(summary, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        latest_tmp_path.replace(latest_path)
+    finally:
+        if latest_tmp_path is not None and latest_tmp_path.exists():
+            latest_tmp_path.unlink()
+    print(f"summary_json:     {summary_path}")
+
+
+def get_git_commit():
+    """Return current git short hash if available, else 'unknown'."""
+    try:
+        result = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+        return result if result else "unknown"
+    except Exception:
+        return "unknown"
+
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
@@ -886,8 +930,7 @@ summary = {
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
-print(f"val_bpb_raw:      {val_bpb_raw:.6f}")
-print(f"val_bpb_ema:      {val_bpb_ema:.6f}" if val_bpb_ema is not None else "val_bpb_ema:      n/a")
+print(f"startup_seconds:  {startup_time:.1f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
@@ -897,11 +940,24 @@ print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
 
+run_ts = datetime.now(timezone.utc)
+run_id = f"{run_ts.strftime('%Y%m%dT%H%M%SZ')}_{os.getpid()}"
 run_summary = {
-    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-    "git_commit": get_git_commit(),
+    "schema_version": 2,
+    "timestamp_utc": run_ts.isoformat(),
+    "run": {
+        "run_id": run_id,
+        "git_commit": get_git_commit(),
+        "pid": os.getpid(),
+        "hostname": platform.node(),
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none",
+    },
     "metrics": {
         "val_bpb": float(val_bpb),
+        "startup_seconds": float(startup_time),
         "training_seconds": float(total_training_time),
         "total_seconds": float(t_end - t_start),
         "peak_vram_mb": float(peak_vram_mb),
@@ -929,10 +985,5 @@ run_summary = {
         "warmdown_ratio": float(WARMDOWN_RATIO),
         "final_lr_frac": float(FINAL_LR_FRAC),
     },
-    "runtime": {
-        "seed": 42,
-        "startup_seconds": float(startup_time),
-    },
-    "hardware": get_hardware_info(),
 }
 save_run_summary(run_summary)

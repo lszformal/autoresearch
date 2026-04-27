@@ -99,11 +99,17 @@ pyproject.toml  — dependencies
 
 Each `uv run train.py` execution now writes a machine-readable JSON summary to `runs/`:
 
-- `runs/run_<timestamp>.json` — immutable summary for a specific run.
+- `runs/run_<timestamp>_<pid>.json` — immutable summary for a specific run.
 - `runs/latest.json` — summary for the most recent run.
-- `runs/history.jsonl` — append-only line-delimited history for fast ingestion.
 
-This makes it easier for autonomous agents to compare experiments without brittle log parsing.
+The summary includes:
+
+- core metrics (`val_bpb`, startup/training/total seconds, peak VRAM, MFU, token throughput proxy),
+- model shape and optimization hyperparameters,
+- run metadata (`git_commit`, host, Python/Torch versions, CUDA device),
+- schema versioning (`schema_version`) for forward-compatible tooling.
+
+This makes it easier for autonomous agents to compare experiments without brittle log parsing and to trace results back to exact code snapshots.
 
 You can analyze the best runs with:
 
@@ -111,11 +117,11 @@ You can analyze the best runs with:
 uv run analyze_runs.py
 uv run analyze_runs.py --limit 20
 uv run analyze_runs.py --json
-uv run analyze_runs.py --newest
 ```
 
+The analyzer also prints best-vs-latest delta and tolerates malformed JSON artifacts by skipping invalid files with a warning.
+
 By default, summaries are written to `./runs`; override with `AUTORESEARCH_RUN_DIR=/path/to/runs`.
-Run summaries now also include `git_commit`, hardware metadata (GPU model + capability), and startup/runtime fields to improve reproducibility audits across machines.
 
 ## Design choices
 
