@@ -35,6 +35,16 @@ def print_table(rows):
         print(" | ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
 
 
+def to_json_safe_runs(runs):
+    json_safe = []
+    for run in runs:
+        item = dict(run)
+        if "_path" in item:
+            item["_path"] = str(item["_path"])
+        json_safe.append(item)
+    return json_safe
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze autoresearch run summaries.")
     parser.add_argument("--run-dir", default="runs", help="Directory containing run_*.json files.")
@@ -54,7 +64,7 @@ def main():
     top = ranked[: args.limit]
 
     if args.json:
-        print(json.dumps(top, indent=2))
+        print(json.dumps(to_json_safe_runs(top), indent=2))
         return
 
     rows = []
