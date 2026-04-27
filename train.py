@@ -821,3 +821,4 @@ run_summary = {
     },
 }
 save_run_summary(run_summary)
+maybe_write_run_artifacts(summary)
