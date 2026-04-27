@@ -9,9 +9,12 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
+import json
 import math
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -466,6 +469,22 @@ tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
 
+
+def save_run_summary(summary):
+    """Persist a machine-readable run summary for downstream research tooling."""
+    run_dir = Path(os.environ.get("AUTORESEARCH_RUN_DIR", "runs"))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    summary_path = run_dir / f"run_{ts}.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    latest_path = run_dir / "latest.json"
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"summary_json:     {summary_path}")
+
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
@@ -628,3 +647,37 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+run_summary = {
+    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    "metrics": {
+        "val_bpb": float(val_bpb),
+        "training_seconds": float(total_training_time),
+        "total_seconds": float(t_end - t_start),
+        "peak_vram_mb": float(peak_vram_mb),
+        "mfu_percent": float(steady_state_mfu),
+        "total_tokens_M": float(total_tokens / 1e6),
+        "num_steps": int(step),
+    },
+    "model": {
+        "num_params_M": float(num_params / 1e6),
+        "depth": int(DEPTH),
+        "aspect_ratio": int(ASPECT_RATIO),
+        "head_dim": int(HEAD_DIM),
+        "window_pattern": WINDOW_PATTERN,
+    },
+    "optimization": {
+        "total_batch_size": int(TOTAL_BATCH_SIZE),
+        "device_batch_size": int(DEVICE_BATCH_SIZE),
+        "embedding_lr": float(EMBEDDING_LR),
+        "unembedding_lr": float(UNEMBEDDING_LR),
+        "matrix_lr": float(MATRIX_LR),
+        "scalar_lr": float(SCALAR_LR),
+        "weight_decay": float(WEIGHT_DECAY),
+        "adam_betas": list(ADAM_BETAS),
+        "warmup_ratio": float(WARMUP_RATIO),
+        "warmdown_ratio": float(WARMDOWN_RATIO),
+        "final_lr_frac": float(FINAL_LR_FRAC),
+    },
+}
+save_run_summary(run_summary)
