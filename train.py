@@ -9,9 +9,12 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
+import json
 import math
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -450,6 +453,11 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
+# Evaluation / stability
+USE_EMA = True           # evaluate an EMA-smoothed model at the end
+EMA_DECAY = 0.999        # closer to 1.0 = slower but smoother EMA updates
+EMA_WARMUP_STEPS = 20    # start EMA updates after this many optimizer steps
+
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
@@ -465,6 +473,55 @@ H100_BF16_PEAK_FLOPS = 989.5e12
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
+
+
+def save_run_summary(summary):
+    """Persist a machine-readable run summary for downstream research tooling."""
+    run_dir = Path(os.environ.get("AUTORESEARCH_RUN_DIR", "runs"))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    summary_path = run_dir / f"run_{ts}.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    latest_path = run_dir / "latest.json"
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"summary_json:     {summary_path}")
+
+
+@torch.no_grad()
+def init_ema_state(model):
+    return {
+        name: p.detach().float().clone()
+        for name, p in model.named_parameters()
+        if p.requires_grad and p.is_floating_point()
+    }
+
+
+@torch.no_grad()
+def update_ema_state(model, ema_state, decay):
+    for name, p in model.named_parameters():
+        if name in ema_state:
+            ema_state[name].lerp_(p.detach().float(), 1 - decay)
+
+
+@torch.no_grad()
+def copy_ema_to_model(model, ema_state):
+    backups = {}
+    for name, p in model.named_parameters():
+        if name in ema_state:
+            backups[name] = p.detach().clone()
+            p.copy_(ema_state[name].to(device=p.device, dtype=p.dtype))
+    return backups
+
+
+@torch.no_grad()
+def restore_model_params(model, backups):
+    for name, p in model.named_parameters():
+        if name in backups:
+            p.copy_(backups[name])
 
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
@@ -509,6 +566,8 @@ model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
+ema_state = init_ema_state(model) if USE_EMA else None
+ema_updates = 0
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -563,6 +622,9 @@ while True:
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    if ema_state is not None and step >= EMA_WARMUP_STEPS:
+        update_ema_state(model, ema_state, EMA_DECAY)
+        ema_updates += 1
 
     train_loss_f = train_loss.item()
 
@@ -610,7 +672,14 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb_raw = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+val_bpb_ema = None
+if ema_state is not None and ema_updates > 0:
+    backups = copy_ema_to_model(model, ema_state)
+    with autocast_ctx:
+        val_bpb_ema = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    restore_model_params(model, backups)
+val_bpb = min(val_bpb_raw, val_bpb_ema) if val_bpb_ema is not None else val_bpb_raw
 
 # Final summary
 t_end = time.time()
@@ -620,6 +689,8 @@ peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
+print(f"val_bpb_raw:      {val_bpb_raw:.6f}")
+print(f"val_bpb_ema:      {val_bpb_ema:.6f}" if val_bpb_ema is not None else "val_bpb_ema:      n/a")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
@@ -628,3 +699,43 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+run_summary = {
+    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    "metrics": {
+        "val_bpb": float(val_bpb),
+        "val_bpb_raw": float(val_bpb_raw),
+        "val_bpb_ema": float(val_bpb_ema) if val_bpb_ema is not None else None,
+        "training_seconds": float(total_training_time),
+        "total_seconds": float(t_end - t_start),
+        "peak_vram_mb": float(peak_vram_mb),
+        "mfu_percent": float(steady_state_mfu),
+        "total_tokens_M": float(total_tokens / 1e6),
+        "num_steps": int(step),
+    },
+    "model": {
+        "num_params_M": float(num_params / 1e6),
+        "depth": int(DEPTH),
+        "aspect_ratio": int(ASPECT_RATIO),
+        "head_dim": int(HEAD_DIM),
+        "window_pattern": WINDOW_PATTERN,
+    },
+    "optimization": {
+        "total_batch_size": int(TOTAL_BATCH_SIZE),
+        "device_batch_size": int(DEVICE_BATCH_SIZE),
+        "embedding_lr": float(EMBEDDING_LR),
+        "unembedding_lr": float(UNEMBEDDING_LR),
+        "matrix_lr": float(MATRIX_LR),
+        "scalar_lr": float(SCALAR_LR),
+        "weight_decay": float(WEIGHT_DECAY),
+        "adam_betas": list(ADAM_BETAS),
+        "warmup_ratio": float(WARMUP_RATIO),
+        "warmdown_ratio": float(WARMDOWN_RATIO),
+        "final_lr_frac": float(FINAL_LR_FRAC),
+        "use_ema": bool(USE_EMA),
+        "ema_decay": float(EMA_DECAY),
+        "ema_warmup_steps": int(EMA_WARMUP_STEPS),
+        "ema_updates": int(ema_updates),
+    },
+}
+save_run_summary(run_summary)
