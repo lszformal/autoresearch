@@ -454,6 +454,10 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
+# Reproducibility
+SEED = 1337             # RNG seed for torch CPU/CUDA
+REPRO_MODE = False      # deterministic mode (slower, stricter kernels)
+
 
 def _env_str(name, default):
     return os.environ.get(name, default)
@@ -467,6 +471,18 @@ def _env_int(name, default):
 def _env_float(name, default):
     value = os.environ.get(name)
     return float(value) if value is not None else default
+
+
+def _env_bool(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean-like value, got: {value!r}")
 
 
 def _env_betas(name, default):
@@ -504,6 +520,8 @@ WARMDOWN_RATIO = _env_float("AUTORESEARCH_WARMDOWN_RATIO", WARMDOWN_RATIO)
 FINAL_LR_FRAC = _env_float("AUTORESEARCH_FINAL_LR_FRAC", FINAL_LR_FRAC)
 DEPTH = _env_int("AUTORESEARCH_DEPTH", DEPTH)
 DEVICE_BATCH_SIZE = _env_int("AUTORESEARCH_DEVICE_BATCH_SIZE", DEVICE_BATCH_SIZE)
+SEED = _env_int("AUTORESEARCH_SEED", SEED)
+REPRO_MODE = _env_bool("AUTORESEARCH_REPRO_MODE", REPRO_MODE)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
