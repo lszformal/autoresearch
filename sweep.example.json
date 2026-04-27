@@ -1,0 +1,24 @@
+{
+  "runs": [
+    {
+      "name": "baseline",
+      "run_dir": "runs",
+      "overrides": {}
+    },
+    {
+      "name": "depth_10",
+      "run_dir": "runs",
+      "overrides": {
+        "AUTORESEARCH_DEPTH": 10
+      }
+    },
+    {
+      "name": "window_full",
+      "run_dir": "runs",
+      "overrides": {
+        "AUTORESEARCH_WINDOW_PATTERN": "L",
+        "AUTORESEARCH_MATRIX_LR": 0.035
+      }
+    }
+  ]
+}
