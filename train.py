@@ -13,6 +13,7 @@ import json
 import math
 import socket
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -671,11 +672,25 @@ def save_run_summary(summary):
         json.dump(summary, f, indent=2, sort_keys=True)
         f.write("\n")
     latest_path = run_dir / "latest.json"
-    latest_tmp_path = run_dir / ".latest.json.tmp"
-    with open(latest_tmp_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, sort_keys=True)
-        f.write("\n")
-    latest_tmp_path.replace(latest_path)
+    latest_tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=run_dir,
+            prefix=".latest.",
+            suffix=".json.tmp",
+            delete=False,
+        ) as f:
+            latest_tmp_path = Path(f.name)
+            json.dump(summary, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        latest_tmp_path.replace(latest_path)
+    finally:
+        if latest_tmp_path is not None and latest_tmp_path.exists():
+            latest_tmp_path.unlink()
     print(f"summary_json:     {summary_path}")
 
 
