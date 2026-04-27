@@ -11,6 +11,8 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import gc
 import json
 import math
+import socket
+import subprocess
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -434,6 +436,33 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
+
+def _env_bool(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean for {name}: {raw!r}")
+
+
+def _env_int(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else int(raw)
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else float(raw)
+
+
+def _env_str(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else raw
+
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
@@ -455,14 +484,46 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
+# Evaluation / stability
+USE_EMA = True           # evaluate an EMA-smoothed model at the end
+EMA_DECAY = 0.999        # closer to 1.0 = slower but smoother EMA updates
+EMA_WARMUP_STEPS = 20    # start EMA updates after this many optimizer steps
+SEED = 1337
+REPRO_MODE = False
+
+# Environment-variable overrides for sweeps and automation.
+ASPECT_RATIO = _env_int("AUTORESEARCH_ASPECT_RATIO", ASPECT_RATIO)
+HEAD_DIM = _env_int("AUTORESEARCH_HEAD_DIM", HEAD_DIM)
+WINDOW_PATTERN = _env_str("AUTORESEARCH_WINDOW_PATTERN", WINDOW_PATTERN)
+TOTAL_BATCH_SIZE = _env_int("AUTORESEARCH_TOTAL_BATCH_SIZE", TOTAL_BATCH_SIZE)
+EMBEDDING_LR = _env_float("AUTORESEARCH_EMBEDDING_LR", EMBEDDING_LR)
+UNEMBEDDING_LR = _env_float("AUTORESEARCH_UNEMBEDDING_LR", UNEMBEDDING_LR)
+MATRIX_LR = _env_float("AUTORESEARCH_MATRIX_LR", MATRIX_LR)
+SCALAR_LR = _env_float("AUTORESEARCH_SCALAR_LR", SCALAR_LR)
+WEIGHT_DECAY = _env_float("AUTORESEARCH_WEIGHT_DECAY", WEIGHT_DECAY)
+WARMUP_RATIO = _env_float("AUTORESEARCH_WARMUP_RATIO", WARMUP_RATIO)
+WARMDOWN_RATIO = _env_float("AUTORESEARCH_WARMDOWN_RATIO", WARMDOWN_RATIO)
+FINAL_LR_FRAC = _env_float("AUTORESEARCH_FINAL_LR_FRAC", FINAL_LR_FRAC)
+DEPTH = _env_int("AUTORESEARCH_DEPTH", DEPTH)
+DEVICE_BATCH_SIZE = _env_int("AUTORESEARCH_DEVICE_BATCH_SIZE", DEVICE_BATCH_SIZE)
+USE_EMA = _env_bool("AUTORESEARCH_USE_EMA", USE_EMA)
+EMA_DECAY = _env_float("AUTORESEARCH_EMA_DECAY", EMA_DECAY)
+EMA_WARMUP_STEPS = _env_int("AUTORESEARCH_EMA_WARMUP_STEPS", EMA_WARMUP_STEPS)
+SEED = _env_int("AUTORESEARCH_SEED", SEED)
+REPRO_MODE = _env_bool("AUTORESEARCH_REPRO_MODE", REPRO_MODE)
+
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
 torch.set_float32_matmul_precision("high")
+if REPRO_MODE:
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 H100_BF16_PEAK_FLOPS = 989.5e12
@@ -470,6 +531,134 @@ H100_BF16_PEAK_FLOPS = 989.5e12
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
+print("Effective hyperparameters:")
+print(f"  DEPTH={DEPTH} ASPECT_RATIO={ASPECT_RATIO} HEAD_DIM={HEAD_DIM} WINDOW_PATTERN={WINDOW_PATTERN}")
+print(f"  TOTAL_BATCH_SIZE={TOTAL_BATCH_SIZE} DEVICE_BATCH_SIZE={DEVICE_BATCH_SIZE}")
+print(f"  EMBEDDING_LR={EMBEDDING_LR} UNEMBEDDING_LR={UNEMBEDDING_LR} MATRIX_LR={MATRIX_LR} SCALAR_LR={SCALAR_LR}")
+print(f"  WEIGHT_DECAY={WEIGHT_DECAY} ADAM_BETAS={ADAM_BETAS} WARMUP_RATIO={WARMUP_RATIO} WARMDOWN_RATIO={WARMDOWN_RATIO} FINAL_LR_FRAC={FINAL_LR_FRAC}")
+
+
+def save_run_summary(summary):
+    """Persist a machine-readable run summary for downstream research tooling."""
+    run_dir = Path(os.environ.get("AUTORESEARCH_RUN_DIR", "runs"))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    summary_path = run_dir / f"run_{ts}.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    latest_path = run_dir / "latest.json"
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"summary_json:     {summary_path}")
+
+
+def save_run_summary(summary):
+    """Persist a machine-readable run summary for downstream research tooling."""
+    run_dir = Path(os.environ.get("AUTORESEARCH_RUN_DIR", "runs"))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    summary_path = run_dir / f"run_{ts}.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    latest_path = run_dir / "latest.json"
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"summary_json:     {summary_path}")
+
+
+def save_run_summary(summary):
+    """Persist a machine-readable run summary for downstream research tooling."""
+    run_dir = Path(os.environ.get("AUTORESEARCH_RUN_DIR", "runs"))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    summary_path = run_dir / f"run_{ts}.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    latest_path = run_dir / "latest.json"
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"summary_json:     {summary_path}")
+
+
+@torch.no_grad()
+def init_ema_state(model):
+    return {
+        name: p.detach().float().clone()
+        for name, p in model.named_parameters()
+        if p.requires_grad and p.is_floating_point()
+    }
+
+
+@torch.no_grad()
+def update_ema_state(model, ema_state, decay):
+    for name, p in model.named_parameters():
+        if name in ema_state:
+            ema_state[name].lerp_(p.detach().float(), 1 - decay)
+
+
+@torch.no_grad()
+def copy_ema_to_model(model, ema_state):
+    backups = {}
+    for name, p in model.named_parameters():
+        if name in ema_state:
+            backups[name] = p.detach().clone()
+            p.copy_(ema_state[name].to(device=p.device, dtype=p.dtype))
+    return backups
+
+
+@torch.no_grad()
+def restore_model_params(model, backups):
+    for name, p in model.named_parameters():
+        if name in backups:
+            p.copy_(backups[name])
+
+
+def save_run_summary(summary):
+    """Persist a machine-readable run summary for downstream research tooling."""
+    run_dir = Path(os.environ.get("AUTORESEARCH_RUN_DIR", "runs"))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    ts = ts.replace(".", "_")
+    summary_path = run_dir / f"run_{ts}.json"
+    with open(summary_path, "x", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    latest_path = run_dir / "latest.json"
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    history_path = run_dir / "history.jsonl"
+    with open(history_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(summary, sort_keys=True))
+        f.write("\n")
+    print(f"summary_json:     {summary_path}")
+
+
+def get_git_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except subprocess.SubprocessError:
+        return None
+
+
+def get_hardware_info():
+    name = torch.cuda.get_device_name(0)
+    cap = torch.cuda.get_device_capability(0)
+    return {
+        "cuda_device_name": name,
+        "cuda_capability": f"{cap[0]}.{cap[1]}",
+        "hostname": socket.gethostname(),
+    }
 
 
 def save_run_summary(summary):
@@ -511,6 +700,31 @@ def build_model_config(depth):
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
 
+def get_git_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def maybe_write_run_artifacts(summary):
+    summary_path = os.environ.get("AUTORESEARCH_SUMMARY_PATH")
+    if summary_path:
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+            f.write("\n")
+        print(f"summary_path:      {summary_path}")
+
+    metrics_path = os.environ.get("AUTORESEARCH_METRICS_JSONL")
+    if metrics_path:
+        with open(metrics_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(summary, sort_keys=True) + "\n")
+        print(f"metrics_jsonl:     {metrics_path}")
+
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -541,6 +755,8 @@ model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
+ema_state = init_ema_state(model) if USE_EMA else None
+ema_updates = 0
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -595,6 +811,9 @@ while True:
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    if ema_state is not None and step >= EMA_WARMUP_STEPS:
+        update_ema_state(model, ema_state, EMA_DECAY)
+        ema_updates += 1
 
     train_loss_f = train_loss.item()
 
@@ -642,13 +861,57 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb_raw = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+val_bpb_ema = None
+if ema_state is not None and ema_updates > 0:
+    backups = copy_ema_to_model(model, ema_state)
+    with autocast_ctx:
+        val_bpb_ema = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    restore_model_params(model, backups)
+val_bpb = min(val_bpb_raw, val_bpb_ema) if val_bpb_ema is not None else val_bpb_raw
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+
+summary = {
+    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    "git_commit": get_git_commit(),
+    "seed": SEED,
+    "repro_mode": REPRO_MODE,
+    "torch_version": torch.__version__,
+    "cuda_device": torch.cuda.get_device_name(),
+    "model_config": asdict(config),
+    "hparams": {
+        "aspect_ratio": ASPECT_RATIO,
+        "head_dim": HEAD_DIM,
+        "window_pattern": WINDOW_PATTERN,
+        "total_batch_size": TOTAL_BATCH_SIZE,
+        "device_batch_size": DEVICE_BATCH_SIZE,
+        "embedding_lr": EMBEDDING_LR,
+        "unembedding_lr": UNEMBEDDING_LR,
+        "matrix_lr": MATRIX_LR,
+        "scalar_lr": SCALAR_LR,
+        "weight_decay": WEIGHT_DECAY,
+        "adam_betas": ADAM_BETAS,
+        "warmup_ratio": WARMUP_RATIO,
+        "warmdown_ratio": WARMDOWN_RATIO,
+        "final_lr_frac": FINAL_LR_FRAC,
+        "depth": DEPTH,
+    },
+    "metrics": {
+        "val_bpb": round(val_bpb, 6),
+        "training_seconds": round(total_training_time, 1),
+        "total_seconds": round(t_end - t_start, 1),
+        "peak_vram_mb": round(peak_vram_mb, 1),
+        "mfu_percent": round(steady_state_mfu, 2),
+        "total_tokens_m": round(total_tokens / 1e6, 1),
+        "num_steps": step,
+        "num_params_m": round(num_params / 1e6, 1),
+    },
+}
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
