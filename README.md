@@ -91,9 +91,28 @@ This removes brittle `grep`/manual formatting steps and keeps experiment records
 prepare.py      — constants, data prep + runtime utilities (do not modify)
 train.py        — model, optimizer, training loop (agent modifies this)
 program.md      — agent instructions
-analyze_results.py — run log parsing + results.tsv tooling
+analyze_runs.py — leaderboard utility for JSON run summaries
 pyproject.toml  — dependencies
 ```
+
+## Experiment tracking and analysis
+
+Each `uv run train.py` execution now writes a machine-readable JSON summary to `runs/`:
+
+- `runs/run_<timestamp>.json` — immutable summary for a specific run.
+- `runs/latest.json` — summary for the most recent run.
+
+This makes it easier for autonomous agents to compare experiments without brittle log parsing.
+
+You can analyze the best runs with:
+
+```bash
+uv run analyze_runs.py
+uv run analyze_runs.py --limit 20
+uv run analyze_runs.py --json
+```
+
+By default, summaries are written to `./runs`; override with `AUTORESEARCH_RUN_DIR=/path/to/runs`.
 
 ## Design choices
 
