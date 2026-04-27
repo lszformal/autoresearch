@@ -21,8 +21,16 @@ def load_runs(run_dir: Path):
     return runs
 
 
+def to_json_safe_run(run: dict) -> dict:
+    """Return a copy of run payload that can be serialized to JSON."""
+    json_safe = dict(run)
+    if "_path" in json_safe:
+        json_safe["_path"] = str(json_safe["_path"])
+    return json_safe
+
+
 def print_table(rows):
-    headers = ["rank", "val_bpb", "steps", "mfu%", "tokens_M", "depth", "window", "file"]
+    headers = ["rank", "val_bpb", "steps", "mfu%", "tokens_M", "depth", "window", "commit", "file"]
     widths = [len(h) for h in headers]
     for row in rows:
         for i, col in enumerate(row):
@@ -33,19 +41,6 @@ def print_table(rows):
     print(sep_line)
     for row in rows:
         print(" | ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
-
-
-def to_json_safe_runs(runs):
-    def convert(value):
-        if isinstance(value, Path):
-            return str(value)
-        if isinstance(value, dict):
-            return {k: convert(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [convert(v) for v in value]
-        return value
-
-    return [convert(run) for run in runs]
 
 
 def main():
@@ -67,7 +62,7 @@ def main():
     top = ranked[: args.limit]
 
     if args.json:
-        print(json.dumps(to_json_safe_runs(top), indent=2))
+        print(json.dumps([to_json_safe_run(run) for run in top], indent=2))
         return
 
     rows = []
@@ -82,6 +77,7 @@ def main():
             f'{metrics["total_tokens_M"]:.1f}',
             str(model["depth"]),
             str(model["window_pattern"]),
+            str(run.get("git_commit", "unknown")),
             run["_path"].name,
         ])
 
