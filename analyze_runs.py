@@ -18,7 +18,7 @@ def load_runs(run_dir: Path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
-            payload["_path"] = path
+            payload["_path"] = str(path)
             payload.setdefault("schema_version", 1)
             runs.append(payload)
         except (OSError, json.JSONDecodeError, KeyError, TypeError):
@@ -76,7 +76,7 @@ def main():
             str(model["depth"]),
             str(model["window_pattern"]),
             str(run_meta.get("git_commit", "n/a")),
-            run["_path"].name,
+            Path(run["_path"]).name,
         ])
 
     print(f"Loaded {len(runs)} runs from {run_dir}")
