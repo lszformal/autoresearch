@@ -18,7 +18,7 @@ def load_runs(run_dir: Path):
             payload = json.load(f)
         if "metrics" not in payload or "val_bpb" not in payload["metrics"]:
             continue
-        payload["_path"] = path
+        payload["_path"] = str(path)
         runs.append(payload)
     return runs
 
@@ -77,7 +77,7 @@ def main():
             run.get("hardware", {}).get("cuda_device_name", "unknown"),
             str(model["depth"]),
             str(model["window_pattern"]),
-            run["_path"].name,
+            Path(run["_path"]).name,
         ])
 
     print(f"Loaded {len(runs)} runs from {run_dir}")
