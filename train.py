@@ -483,6 +483,13 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
+# Reproducibility / evaluation
+SEED = 1337
+REPRO_MODE = 0
+USE_EMA = 1
+EMA_DECAY = 0.999
+EMA_WARMUP_STEPS = 100
+
 # Post-pretraining reasoning phase (policy gradient)
 REASONING_RL_ENABLED = 1
 REASONING_RL_STEPS = 12
@@ -540,6 +547,11 @@ WARMDOWN_RATIO = _env_float("AUTORESEARCH_WARMDOWN_RATIO", WARMDOWN_RATIO)
 FINAL_LR_FRAC = _env_float("AUTORESEARCH_FINAL_LR_FRAC", FINAL_LR_FRAC)
 DEPTH = _env_int("AUTORESEARCH_DEPTH", DEPTH)
 DEVICE_BATCH_SIZE = _env_int("AUTORESEARCH_DEVICE_BATCH_SIZE", DEVICE_BATCH_SIZE)
+SEED = _env_int("AUTORESEARCH_SEED", SEED)
+REPRO_MODE = _env_bool("AUTORESEARCH_REPRO_MODE", bool(REPRO_MODE))
+USE_EMA = _env_bool("AUTORESEARCH_USE_EMA", bool(USE_EMA))
+EMA_DECAY = _env_float("AUTORESEARCH_EMA_DECAY", EMA_DECAY)
+EMA_WARMUP_STEPS = _env_int("AUTORESEARCH_EMA_WARMUP_STEPS", EMA_WARMUP_STEPS)
 REASONING_RL_ENABLED = _env_int("AUTORESEARCH_REASONING_RL_ENABLED", REASONING_RL_ENABLED)
 REASONING_RL_STEPS = _env_int("AUTORESEARCH_REASONING_RL_STEPS", REASONING_RL_STEPS)
 REASONING_RL_BATCH_SIZE = _env_int("AUTORESEARCH_REASONING_RL_BATCH_SIZE", REASONING_RL_BATCH_SIZE)
@@ -570,6 +582,7 @@ print(f"  DEPTH={DEPTH} ASPECT_RATIO={ASPECT_RATIO} HEAD_DIM={HEAD_DIM} WINDOW_P
 print(f"  TOTAL_BATCH_SIZE={TOTAL_BATCH_SIZE} DEVICE_BATCH_SIZE={DEVICE_BATCH_SIZE}")
 print(f"  EMBEDDING_LR={EMBEDDING_LR} UNEMBEDDING_LR={UNEMBEDDING_LR} MATRIX_LR={MATRIX_LR} SCALAR_LR={SCALAR_LR}")
 print(f"  WEIGHT_DECAY={WEIGHT_DECAY} ADAM_BETAS={ADAM_BETAS} WARMUP_RATIO={WARMUP_RATIO} WARMDOWN_RATIO={WARMDOWN_RATIO} FINAL_LR_FRAC={FINAL_LR_FRAC}")
+print(f"  SEED={SEED} REPRO_MODE={REPRO_MODE} USE_EMA={USE_EMA} EMA_DECAY={EMA_DECAY} EMA_WARMUP_STEPS={EMA_WARMUP_STEPS}")
 print(f"  REASONING_RL_ENABLED={REASONING_RL_ENABLED} REASONING_RL_STEPS={REASONING_RL_STEPS} REASONING_RL_BATCH_SIZE={REASONING_RL_BATCH_SIZE} REASONING_RL_LR={REASONING_RL_LR}")
 
 
@@ -597,6 +610,31 @@ def build_model_config(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )
+
+
+def init_ema_state(model_for_ema):
+    return [p.detach().clone() for p in model_for_ema.parameters()]
+
+
+@torch.no_grad()
+def update_ema_state(model_for_ema, ema_state, decay):
+    for ema_param, model_param in zip(ema_state, model_for_ema.parameters()):
+        ema_param.mul_(decay).add_(model_param.detach(), alpha=(1.0 - decay))
+
+
+@torch.no_grad()
+def copy_ema_to_model(model_for_ema, ema_state):
+    backups = []
+    for model_param, ema_param in zip(model_for_ema.parameters(), ema_state):
+        backups.append(model_param.detach().clone())
+        model_param.copy_(ema_param)
+    return backups
+
+
+@torch.no_grad()
+def restore_model_params(model_for_ema, backups):
+    for model_param, original in zip(model_for_ema.parameters(), backups):
+        model_param.copy_(original)
 
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
