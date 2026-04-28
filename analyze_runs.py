@@ -16,7 +16,7 @@ def load_runs(run_dir: Path):
     for path in sorted(run_dir.glob("run_*.json")):
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
-        payload["_path"] = path
+        payload["_path"] = str(path)
         runs.append(payload)
     return runs
 
@@ -71,7 +71,7 @@ def main():
             str(model["window_pattern"]),
             str(run.get("reasoning_phase", {}).get("enabled", False)),
             str(run.get("git_commit", "unknown")),
-            run["_path"].name,
+            Path(run["_path"]).name,
         ])
 
     print(f"Loaded {len(runs)} runs from {run_dir}")
