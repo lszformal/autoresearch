@@ -17,8 +17,16 @@
       "run_dir": "runs",
       "overrides": {
         "AUTORESEARCH_WINDOW_PATTERN": "L",
-        "AUTORESEARCH_MATRIX_LR": 0.035,
-        "AUTORESEARCH_REASONING_RL_STEPS": 16
+        "AUTORESEARCH_MATRIX_LR": 0.035
+      }
+    },
+    {
+      "name": "reasoning_phase_on",
+      "run_dir": "runs",
+      "overrides": {
+        "AUTORESEARCH_REASONING_PHASE": 1,
+        "AUTORESEARCH_REASONING_SFT_STEPS": 120,
+        "AUTORESEARCH_REASONING_RL_STEPS": 120
       }
     }
   ]

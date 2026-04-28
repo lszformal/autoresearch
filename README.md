@@ -97,6 +97,30 @@ sweep.example.json — example sweep specification
 pyproject.toml  — dependencies
 ```
 
+## Optional reasoning phase (CoT + reward-based fine-tuning)
+
+`train.py` now supports an optional post-pretraining phase where the model is trained to output a short chain-of-thought before final answers on synthetic arithmetic prompts, followed by a reward-shaped optimization step that rewards correct answers and penalizes wrong ones.
+
+Enable it with environment variables:
+
+```bash
+AUTORESEARCH_REASONING_PHASE=1 \
+AUTORESEARCH_REASONING_SFT_STEPS=150 \
+AUTORESEARCH_REASONING_RL_STEPS=150 \
+uv run train.py
+```
+
+Related knobs:
+
+- `AUTORESEARCH_REASONING_PHASE` (`0/1`)
+- `AUTORESEARCH_REASONING_SFT_STEPS`
+- `AUTORESEARCH_REASONING_RL_STEPS`
+- `AUTORESEARCH_REASONING_BATCH_SIZE`
+- `AUTORESEARCH_REASONING_LR`
+- `AUTORESEARCH_REASONING_MAX_TOKENS`
+
+Run summaries include a `reasoning_phase` section when enabled, so analysis tools/agents can track whether CoT+reward training was used in that experiment.
+
 ## Experiment tracking and analysis
 
 Each `uv run train.py` execution now writes a machine-readable JSON summary to `runs/`:
@@ -145,11 +169,6 @@ Available overrides:
 - `AUTORESEARCH_WARMUP_RATIO`
 - `AUTORESEARCH_WARMDOWN_RATIO`
 - `AUTORESEARCH_FINAL_LR_FRAC`
-- `AUTORESEARCH_REASONING_RL_ENABLED` (1/0)
-- `AUTORESEARCH_REASONING_RL_STEPS`
-- `AUTORESEARCH_REASONING_RL_BATCH_SIZE`
-- `AUTORESEARCH_REASONING_RL_MAX_NEW_TOKENS`
-- `AUTORESEARCH_REASONING_RL_LR`
 
 ### Running a sweep
 
@@ -159,17 +178,6 @@ For unattended experiments, you can run a sequence of trials from a JSON file:
 uv run run_sweep.py --spec sweep.example.json
 uv run run_sweep.py --spec my_sweep.json --max-runs 5
 ```
-
-### Chain-of-thought + reinforcement learning phase
-
-After the base pretraining loop, `train.py` now includes an optional lightweight reasoning phase:
-
-- Prompts are synthetic arithmetic tasks that explicitly request reasoning in `<think>...</think>` plus a final `<answer>...</answer>`.
-- The model is optimized with policy gradient (REINFORCE-style):
-  - **reward +1** for correct final answer,
-  - **reward -1** for incorrect final answer,
-  - **reward +0.2** bonus for producing explicit `<think>...</think>` reasoning.
-- Summary metrics (`avg_reward`, `avg_accuracy`, `avg_cot_rate`) are saved into run JSON output under `reasoning_rl`.
 
 ## Design choices
 

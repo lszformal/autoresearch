@@ -22,7 +22,7 @@ def load_runs(run_dir: Path):
 
 
 def print_table(rows):
-    headers = ["rank", "val_bpb", "steps", "mfu%", "tokens_M", "depth", "window", "commit", "file"]
+    headers = ["rank", "val_bpb", "steps", "mfu%", "tokens_M", "depth", "window", "reasoning", "commit", "file"]
     widths = [len(h) for h in headers]
     for row in rows:
         for i, col in enumerate(row):
@@ -69,6 +69,7 @@ def main():
             f'{metrics["total_tokens_M"]:.1f}',
             str(model["depth"]),
             str(model["window_pattern"]),
+            str(run.get("reasoning_phase", {}).get("enabled", False)),
             str(run.get("git_commit", "unknown")),
             Path(run["_path"]).name,
         ])
