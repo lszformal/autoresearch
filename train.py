@@ -12,6 +12,7 @@ import gc
 import json
 import math
 import random
+import re
 import subprocess
 import time
 from dataclasses import dataclass, asdict
@@ -482,6 +483,15 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
+# Post-pretraining reasoning alignment (chain-of-thought + RL reward shaping)
+REASONING_PHASE_ENABLED = True
+REASONING_SFT_STEPS = 32
+REASONING_RL_STEPS = 32
+REASONING_BATCH_SIZE = 32
+REASONING_SEQ_LEN = 128
+REASONING_LR_FRAC = 0.1
+REASONING_MAX_INT = 99
+
 
 def _env_str(name, default):
     return os.environ.get(name, default)
@@ -495,13 +505,6 @@ def _env_int(name, default):
 def _env_float(name, default):
     value = os.environ.get(name)
     return float(value) if value is not None else default
-
-
-def _env_bool(name, default=False):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _env_betas(name, default):
@@ -539,14 +542,13 @@ WARMDOWN_RATIO = _env_float("AUTORESEARCH_WARMDOWN_RATIO", WARMDOWN_RATIO)
 FINAL_LR_FRAC = _env_float("AUTORESEARCH_FINAL_LR_FRAC", FINAL_LR_FRAC)
 DEPTH = _env_int("AUTORESEARCH_DEPTH", DEPTH)
 DEVICE_BATCH_SIZE = _env_int("AUTORESEARCH_DEVICE_BATCH_SIZE", DEVICE_BATCH_SIZE)
-
-# Optional post-pretraining reasoning phase (SFT + reward optimization)
-REASONING_PHASE_ENABLED = _env_bool("AUTORESEARCH_REASONING_PHASE", False)
-REASONING_SFT_STEPS = _env_int("AUTORESEARCH_REASONING_SFT_STEPS", 100)
-REASONING_RL_STEPS = _env_int("AUTORESEARCH_REASONING_RL_STEPS", 100)
-REASONING_BATCH_SIZE = _env_int("AUTORESEARCH_REASONING_BATCH_SIZE", 16)
-REASONING_LR = _env_float("AUTORESEARCH_REASONING_LR", 3e-5)
-REASONING_MAX_TOKENS = _env_int("AUTORESEARCH_REASONING_MAX_TOKENS", 256)
+REASONING_PHASE_ENABLED = _env_bool("AUTORESEARCH_REASONING_PHASE_ENABLED", REASONING_PHASE_ENABLED)
+REASONING_SFT_STEPS = _env_int("AUTORESEARCH_REASONING_SFT_STEPS", REASONING_SFT_STEPS)
+REASONING_RL_STEPS = _env_int("AUTORESEARCH_REASONING_RL_STEPS", REASONING_RL_STEPS)
+REASONING_BATCH_SIZE = _env_int("AUTORESEARCH_REASONING_BATCH_SIZE", REASONING_BATCH_SIZE)
+REASONING_SEQ_LEN = _env_int("AUTORESEARCH_REASONING_SEQ_LEN", REASONING_SEQ_LEN)
+REASONING_LR_FRAC = _env_float("AUTORESEARCH_REASONING_LR_FRAC", REASONING_LR_FRAC)
+REASONING_MAX_INT = _env_int("AUTORESEARCH_REASONING_MAX_INT", REASONING_MAX_INT)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -572,8 +574,9 @@ print(f"  DEPTH={DEPTH} ASPECT_RATIO={ASPECT_RATIO} HEAD_DIM={HEAD_DIM} WINDOW_P
 print(f"  TOTAL_BATCH_SIZE={TOTAL_BATCH_SIZE} DEVICE_BATCH_SIZE={DEVICE_BATCH_SIZE}")
 print(f"  EMBEDDING_LR={EMBEDDING_LR} UNEMBEDDING_LR={UNEMBEDDING_LR} MATRIX_LR={MATRIX_LR} SCALAR_LR={SCALAR_LR}")
 print(f"  WEIGHT_DECAY={WEIGHT_DECAY} ADAM_BETAS={ADAM_BETAS} WARMUP_RATIO={WARMUP_RATIO} WARMDOWN_RATIO={WARMDOWN_RATIO} FINAL_LR_FRAC={FINAL_LR_FRAC}")
-print(f"  REASONING_PHASE_ENABLED={REASONING_PHASE_ENABLED} REASONING_SFT_STEPS={REASONING_SFT_STEPS} REASONING_RL_STEPS={REASONING_RL_STEPS}")
-print(f"  REASONING_BATCH_SIZE={REASONING_BATCH_SIZE} REASONING_LR={REASONING_LR} REASONING_MAX_TOKENS={REASONING_MAX_TOKENS}")
+print(f"  REASONING_PHASE_ENABLED={REASONING_PHASE_ENABLED}")
+print(f"  REASONING_SFT_STEPS={REASONING_SFT_STEPS} REASONING_RL_STEPS={REASONING_RL_STEPS} REASONING_BATCH_SIZE={REASONING_BATCH_SIZE}")
+print(f"  REASONING_SEQ_LEN={REASONING_SEQ_LEN} REASONING_LR_FRAC={REASONING_LR_FRAC} REASONING_MAX_INT={REASONING_MAX_INT}")
 
 
 def save_run_summary(summary):
@@ -590,120 +593,6 @@ def save_run_summary(summary):
         json.dump(summary, f, indent=2, sort_keys=True)
         f.write("\n")
     print(f"summary_json:     {summary_path}")
-
-
-def make_reasoning_problem():
-    """Generate a small arithmetic reasoning sample with chain-of-thought target."""
-    a = random.randint(2, 99)
-    b = random.randint(2, 99)
-    op = random.choice(["+", "-", "*"])
-    if op == "+":
-        answer = a + b
-        reasoning = f"We add {a} and {b}. {a} + {b} = {answer}."
-    elif op == "-":
-        if b > a:
-            a, b = b, a
-        answer = a - b
-        reasoning = f"We subtract {b} from {a}. {a} - {b} = {answer}."
-    else:
-        a = random.randint(2, 20)
-        b = random.randint(2, 20)
-        answer = a * b
-        reasoning = f"We multiply {a} by {b}. {a} * {b} = {answer}."
-
-    wrong_answer = answer + random.choice([-3, -2, -1, 1, 2, 3])
-    if wrong_answer == answer:
-        wrong_answer += 1
-
-    prompt = (
-        f"Question: What is {a} {op} {b}?\n"
-        "Think step by step, then give final answer.\n"
-        "Reasoning:"
-    )
-    correct_completion = f" {reasoning}\nFinal answer: {answer}"
-    wrong_completion = f" {reasoning}\nFinal answer: {wrong_answer}"
-    return prompt, correct_completion, wrong_completion, answer
-
-
-def build_reasoning_batch(tokenizer, batch_size, seq_len, device, wrong_answers=False):
-    bos = tokenizer.get_bos_token_id()
-    x = torch.full((batch_size, seq_len), bos, dtype=torch.long, device=device)
-    y = torch.full((batch_size, seq_len), -1, dtype=torch.long, device=device)
-    labels = []
-    for i in range(batch_size):
-        prompt, correct_completion, wrong_completion, label = make_reasoning_problem()
-        completion = wrong_completion if wrong_answers else correct_completion
-        prompt_ids = tokenizer.encode(prompt)
-        full_ids = [bos] + tokenizer.encode(prompt + completion)
-        full_ids = full_ids[: seq_len + 1]
-        if len(full_ids) < 2:
-            continue
-        x_ids = full_ids[:-1]
-        y_ids = full_ids[1:]
-        n = min(seq_len, len(x_ids))
-        x[i, :n] = torch.tensor(x_ids[:n], dtype=torch.long, device=device)
-        y[i, :n] = torch.tensor(y_ids[:n], dtype=torch.long, device=device)
-        prompt_mask_len = min(n, len(prompt_ids))
-        y[i, :prompt_mask_len] = -1
-        labels.append(label)
-    return x, y, labels
-
-
-def run_reasoning_training_phase(model, tokenizer, device):
-    """
-    Phase 2/3 training:
-      1) SFT on chain-of-thought format.
-      2) Reward-optimized contrastive step (correct answer reward, wrong penalty).
-    """
-    reasoning_stats = {"enabled": True}
-    optimizer = torch.optim.AdamW(model.parameters(), lr=REASONING_LR)
-
-    # Stage A: supervised reasoning traces
-    model.train()
-    sft_loss = 0.0
-    for step_idx in range(REASONING_SFT_STEPS):
-        x, y, _ = build_reasoning_batch(
-            tokenizer, REASONING_BATCH_SIZE, min(REASONING_MAX_TOKENS, MAX_SEQ_LEN), device, wrong_answers=False
-        )
-        with autocast_ctx:
-            loss = model(x, y)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-        sft_loss += loss.item()
-        if (step_idx + 1) % max(1, REASONING_SFT_STEPS // 5) == 0:
-            print(f"reasoning_sft {step_idx + 1}/{REASONING_SFT_STEPS} | loss: {sft_loss / (step_idx + 1):.6f}")
-
-    # Stage B: reward optimization with explicit positive/negative signal
-    # Minimize NLL(correct) - NLL(wrong), equivalent to rewarding correct and penalizing wrong.
-    rl_loss = 0.0
-    for step_idx in range(REASONING_RL_STEPS):
-        x_pos, y_pos, _ = build_reasoning_batch(
-            tokenizer, REASONING_BATCH_SIZE, min(REASONING_MAX_TOKENS, MAX_SEQ_LEN), device, wrong_answers=False
-        )
-        x_neg, y_neg, _ = build_reasoning_batch(
-            tokenizer, REASONING_BATCH_SIZE, min(REASONING_MAX_TOKENS, MAX_SEQ_LEN), device, wrong_answers=True
-        )
-        with autocast_ctx:
-            pos_nll = model(x_pos, y_pos, reduction='none').view(REASONING_BATCH_SIZE, -1)
-            neg_nll = model(x_neg, y_neg, reduction='none').view(REASONING_BATCH_SIZE, -1)
-            pos_mask = (y_pos != -1).float()
-            neg_mask = (y_neg != -1).float()
-            pos_score = (pos_nll * pos_mask).sum(dim=1) / pos_mask.sum(dim=1).clamp_min(1.0)
-            neg_score = (neg_nll * neg_mask).sum(dim=1) / neg_mask.sum(dim=1).clamp_min(1.0)
-            loss = (pos_score - neg_score).mean()
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-        rl_loss += loss.item()
-        if (step_idx + 1) % max(1, REASONING_RL_STEPS // 5) == 0:
-            print(f"reasoning_rl  {step_idx + 1}/{REASONING_RL_STEPS} | loss: {rl_loss / (step_idx + 1):.6f}")
-
-    reasoning_stats["sft_loss_mean"] = sft_loss / max(1, REASONING_SFT_STEPS)
-    reasoning_stats["rl_loss_mean"] = rl_loss / max(1, REASONING_RL_STEPS)
-    reasoning_stats["sft_steps"] = REASONING_SFT_STEPS
-    reasoning_stats["rl_steps"] = REASONING_RL_STEPS
-    return reasoning_stats
 
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
@@ -824,127 +713,140 @@ def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)
 
 
-def make_reasoning_batch(batch_size):
-    """
-    Build synthetic arithmetic prompts with explicit CoT requirement.
-    """
-    samples = []
-    for _ in range(batch_size):
-        a = random.randint(2, 99)
-        b = random.randint(2, 99)
-        op = random.choice(["+", "-", "*"])
-        if op == "+":
-            ans = a + b
-        elif op == "-":
-            ans = a - b
-        else:
-            ans = a * b
-        prompt = (
-            "Solve the problem. Think step by step inside <think>...</think> and end with "
-            "<answer>NUMBER</answer>.\n"
-            f"Question: {a} {op} {b}\n"
-            "Response:\n"
-        )
-        samples.append((prompt, str(ans)))
-    return samples
+def _pad_or_truncate(ids, target_len, pad_id=0):
+    if len(ids) >= target_len:
+        return ids[:target_len]
+    return ids + [pad_id] * (target_len - len(ids))
 
 
-def extract_answer(text):
-    m = re.search(r"<answer>\s*(-?\d+)\s*</answer>", text)
-    return m.group(1) if m else None
-
-
-def sample_with_logprobs(model_for_sampling, prompt_ids, max_new_tokens):
-    """
-    Sample continuation tokens first (without graph retention), then compute a
-    single differentiable policy term from a teacher-forced forward pass.
-    """
-    sampled = []
-    x = torch.tensor(prompt_ids, dtype=torch.long, device=device)[None, :]
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            logits = model_for_sampling(x)
-            logits_last = logits[:, -1, :]
-            probs = F.softmax(logits_last, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            sampled.append(next_token.item())
-            x = torch.cat([x, next_token], dim=1)
-            if next_token.item() == tokenizer.get_bos_token_id():
-                break
-
-    if not sampled:
-        return sampled, None
-
-    full_ids = torch.tensor(prompt_ids + sampled, dtype=torch.long, device=device)[None, :]
-    logits = model_for_sampling(full_ids)
-    sampled_start = len(prompt_ids) - 1
-    sampled_end = sampled_start + len(sampled)
-    logits_for_sampled = logits[:, sampled_start:sampled_end, :]
-    target_tokens = full_ids[:, len(prompt_ids):]
-    token_logprobs = F.log_softmax(logits_for_sampled, dim=-1).gather(
-        -1, target_tokens.unsqueeze(-1)
-    ).squeeze(-1)
-    sample_policy_term = token_logprobs.mean()
-    return sampled, sample_policy_term
-
-
-def run_reasoning_rl_phase(model_for_rl):
-    if REASONING_RL_ENABLED <= 0 or REASONING_RL_STEPS <= 0:
-        return {"enabled": False}
-    print("---")
-    print("reasoning_rl: starting policy-gradient phase")
-    model_for_rl.train()
-    rl_optimizer = torch.optim.AdamW(model_for_rl.parameters(), lr=REASONING_RL_LR, betas=(0.9, 0.99), weight_decay=0.0)
-    reward_history = []
-    accuracy_history = []
-    cot_history = []
-
-    for rl_step in range(REASONING_RL_STEPS):
-        batch = make_reasoning_batch(REASONING_RL_BATCH_SIZE)
-        sample_terms = []
-        rewards = []
-        correct = 0
-        cot_present = 0
-        for prompt, gold_answer in batch:
-            prompt_ids = tokenizer.encode(prompt, prepend=tokenizer.get_bos_token_id())
-            sampled_ids, sample_policy_term = sample_with_logprobs(model_for_rl, prompt_ids, REASONING_RL_MAX_NEW_TOKENS)
-            if sample_policy_term is None:
-                continue
-            completion = tokenizer.decode(sampled_ids)
-            pred_answer = extract_answer(completion)
-            has_cot = int("<think>" in completion and "</think>" in completion)
-            is_correct = int(pred_answer == gold_answer)
-            reward = 1.0 * is_correct - 1.0 * (1 - is_correct) + 0.2 * has_cot
-            sample_terms.append(sample_policy_term)
-            rewards.append(reward)
-            correct += is_correct
-            cot_present += has_cot
-
-        if not sample_terms:
+def sample_reasoning_examples(batch_size, max_int, require_single_token_answer=False):
+    examples = []
+    while len(examples) < batch_size:
+        a = random.randint(0, max_int)
+        b = random.randint(0, max_int)
+        answer = a + b
+        ans_text = str(answer)
+        if require_single_token_answer and len(tokenizer.encode(f" {ans_text}")) != 1:
             continue
-        reward_tensor = torch.tensor(rewards, device=device, dtype=torch.float32)
-        advantage = reward_tensor - reward_tensor.mean()
-        policy_terms = torch.stack(sample_terms)
-        rl_loss = -(advantage * policy_terms).mean()
-        rl_optimizer.zero_grad(set_to_none=True)
-        rl_loss.backward()
-        rl_optimizer.step()
-        avg_reward = float(reward_tensor.mean().item())
-        acc = correct / max(1, len(rewards))
-        cot_rate = cot_present / max(1, len(rewards))
-        reward_history.append(avg_reward)
-        accuracy_history.append(acc)
-        cot_history.append(cot_rate)
-        print(f"reasoning_rl step {rl_step+1:03d}/{REASONING_RL_STEPS} | reward: {avg_reward:+.3f} | acc: {acc:.2f} | cot_rate: {cot_rate:.2f}")
+        prompt = f"Question: What is {a} + {b}? Think step by step before answering.\nReasoning:"
+        completion = f" {a} + {b} = {answer}.\nFinal answer: {answer}"
+        examples.append({
+            "a": a,
+            "b": b,
+            "answer_text": ans_text,
+            "prompt": prompt,
+            "completion": completion,
+        })
+    return examples
 
-    if not reward_history:
-        return {"enabled": True, "steps": 0}
+
+def build_reasoning_sft_batch(batch_size, seq_len):
+    examples = sample_reasoning_examples(batch_size=batch_size, max_int=REASONING_MAX_INT)
+    x_rows, y_rows = [], []
+    bos = tokenizer.get_bos_token_id()
+    for ex in examples:
+        prompt_ids = tokenizer.encode(ex["prompt"], prepend=bos)
+        full_ids = tokenizer.encode(ex["prompt"] + ex["completion"], prepend=bos)
+        full_ids = full_ids[:seq_len + 1]
+        if len(full_ids) < 2:
+            continue
+        x_ids = _pad_or_truncate(full_ids[:-1], seq_len, pad_id=0)
+        y_ids = _pad_or_truncate(full_ids[1:], seq_len, pad_id=-1)
+        prompt_prefix = max(0, min(seq_len, len(prompt_ids) - 1))
+        for i in range(prompt_prefix):
+            y_ids[i] = -1
+        x_rows.append(x_ids)
+        y_rows.append(y_ids)
+    x = torch.tensor(x_rows, dtype=torch.long, device=device)
+    y = torch.tensor(y_rows, dtype=torch.long, device=device)
+    return x, y
+
+
+def build_reasoning_rl_batch(batch_size, seq_len):
+    examples = sample_reasoning_examples(
+        batch_size=batch_size, max_int=REASONING_MAX_INT, require_single_token_answer=True
+    )
+    bos = tokenizer.get_bos_token_id()
+    x_rows, lengths, answer_tokens, answer_texts = [], [], [], []
+    for ex in examples:
+        prefix = (
+            f"Question: What is {ex['a']} + {ex['b']}? Think step by step before answering.\n"
+            f"Reasoning: {ex['a']} + {ex['b']} = {ex['answer_text']}.\nFinal answer:"
+        )
+        ids = tokenizer.encode(prefix, prepend=bos)
+        ids = ids[-seq_len:]
+        lengths.append(len(ids))
+        x_rows.append(_pad_or_truncate(ids, seq_len, pad_id=0))
+        answer_tok = tokenizer.encode(f" {ex['answer_text']}")[0]
+        answer_tokens.append(answer_tok)
+        answer_texts.append(ex["answer_text"])
+    x = torch.tensor(x_rows, dtype=torch.long, device=device)
+    answer_tokens = torch.tensor(answer_tokens, dtype=torch.long, device=device)
+    return x, lengths, answer_tokens, answer_texts
+
+
+def run_reasoning_alignment_phase(model, optimizer):
+    if REASONING_SFT_STEPS <= 0 and REASONING_RL_STEPS <= 0:
+        return {"enabled": False}
+
+    print("\n---")
+    print("Starting reasoning alignment phase (CoT SFT + RL reward shaping)")
+    for group in optimizer.param_groups:
+        group["lr"] = group["initial_lr"] * REASONING_LR_FRAC
+
+    model.train()
+    sft_loss_last = float("nan")
+    for i in range(REASONING_SFT_STEPS):
+        x_sft, y_sft = build_reasoning_sft_batch(REASONING_BATCH_SIZE, REASONING_SEQ_LEN)
+        with autocast_ctx:
+            sft_loss = model(x_sft, y_sft)
+        optimizer.zero_grad(set_to_none=True)
+        sft_loss.backward()
+        optimizer.step()
+        sft_loss_last = sft_loss.item()
+        if i % 8 == 0 or i == REASONING_SFT_STEPS - 1:
+            print(f"[reasoning-sft] step {i+1}/{REASONING_SFT_STEPS} loss={sft_loss_last:.4f}")
+
+    rl_reward_mean = 0.0
+    rl_accuracy = 0.0
+    for i in range(REASONING_RL_STEPS):
+        x_rl, lengths, answer_tokens, answer_texts = build_reasoning_rl_batch(REASONING_BATCH_SIZE, REASONING_SEQ_LEN)
+        with autocast_ctx:
+            logits = model(x_rl)
+        last_logits = torch.stack([logits[b, lengths[b] - 1] for b in range(len(lengths))], dim=0)
+        log_probs = F.log_softmax(last_logits, dim=-1)
+        probs = log_probs.exp()
+        sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        rewards = torch.where(sampled_tokens == answer_tokens, 1.0, -1.0)
+        baseline = rewards.mean()
+        advantages = rewards - baseline
+        selected_log_probs = log_probs.gather(1, sampled_tokens.unsqueeze(-1)).squeeze(-1)
+        rl_loss = -(advantages * selected_log_probs).mean()
+
+        optimizer.zero_grad(set_to_none=True)
+        rl_loss.backward()
+        optimizer.step()
+
+        rl_reward_mean = rewards.mean().item()
+        rl_accuracy = (sampled_tokens == answer_tokens).float().mean().item()
+        if i % 8 == 0 or i == REASONING_RL_STEPS - 1:
+            sampled_text = tokenizer.decode([sampled_tokens[0].item()])
+            gold_text = answer_texts[0]
+            sampled_num = re.findall(r"-?\d+", sampled_text)
+            sampled_num = sampled_num[-1] if sampled_num else sampled_text.strip()
+            print(
+                f"[reasoning-rl] step {i+1}/{REASONING_RL_STEPS} "
+                f"loss={rl_loss.item():.4f} reward_mean={rl_reward_mean:.3f} "
+                f"acc={rl_accuracy:.3f} sample_pred={sampled_num!r} gold={gold_text!r}"
+            )
+
     return {
         "enabled": True,
-        "steps": len(reward_history),
-        "avg_reward": float(sum(reward_history) / len(reward_history)),
-        "avg_accuracy": float(sum(accuracy_history) / len(accuracy_history)),
-        "avg_cot_rate": float(sum(cot_history) / len(cot_history)),
+        "sft_steps": REASONING_SFT_STEPS,
+        "rl_steps": REASONING_RL_STEPS,
+        "sft_loss_last": float(sft_loss_last),
+        "rl_reward_mean_last": float(rl_reward_mean),
+        "rl_accuracy_last": float(rl_accuracy),
     }
 
 # ---------------------------------------------------------------------------
@@ -1034,6 +936,8 @@ if REASONING_PHASE_ENABLED:
     reasoning_stats = run_reasoning_training_phase(model, tokenizer, device)
 
 # Final eval
+model.eval()
+reasoning_alignment = run_reasoning_alignment_phase(model, optimizer)
 model.eval()
 with autocast_ctx:
     val_bpb_raw = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
@@ -1132,6 +1036,6 @@ run_summary = {
         "warmdown_ratio": float(WARMDOWN_RATIO),
         "final_lr_frac": float(FINAL_LR_FRAC),
     },
-    "reasoning_phase": reasoning_stats,
+    "reasoning_alignment": reasoning_alignment,
 }
 save_run_summary(run_summary)

@@ -21,12 +21,12 @@
       }
     },
     {
-      "name": "reasoning_phase_on",
+      "name": "reasoning_heavier",
       "run_dir": "runs",
       "overrides": {
-        "AUTORESEARCH_REASONING_PHASE": 1,
-        "AUTORESEARCH_REASONING_SFT_STEPS": 120,
-        "AUTORESEARCH_REASONING_RL_STEPS": 120
+        "AUTORESEARCH_REASONING_SFT_STEPS": 64,
+        "AUTORESEARCH_REASONING_RL_STEPS": 64,
+        "AUTORESEARCH_REASONING_LR_FRAC": 0.15
       }
     }
   ]

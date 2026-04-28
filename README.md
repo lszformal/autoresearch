@@ -97,30 +97,6 @@ sweep.example.json — example sweep specification
 pyproject.toml  — dependencies
 ```
 
-## Optional reasoning phase (CoT + reward-based fine-tuning)
-
-`train.py` now supports an optional post-pretraining phase where the model is trained to output a short chain-of-thought before final answers on synthetic arithmetic prompts, followed by a reward-shaped optimization step that rewards correct answers and penalizes wrong ones.
-
-Enable it with environment variables:
-
-```bash
-AUTORESEARCH_REASONING_PHASE=1 \
-AUTORESEARCH_REASONING_SFT_STEPS=150 \
-AUTORESEARCH_REASONING_RL_STEPS=150 \
-uv run train.py
-```
-
-Related knobs:
-
-- `AUTORESEARCH_REASONING_PHASE` (`0/1`)
-- `AUTORESEARCH_REASONING_SFT_STEPS`
-- `AUTORESEARCH_REASONING_RL_STEPS`
-- `AUTORESEARCH_REASONING_BATCH_SIZE`
-- `AUTORESEARCH_REASONING_LR`
-- `AUTORESEARCH_REASONING_MAX_TOKENS`
-
-Run summaries include a `reasoning_phase` section when enabled, so analysis tools/agents can track whether CoT+reward training was used in that experiment.
-
 ## Experiment tracking and analysis
 
 Each `uv run train.py` execution now writes a machine-readable JSON summary to `runs/`:
@@ -178,6 +154,38 @@ For unattended experiments, you can run a sequence of trials from a JSON file:
 uv run run_sweep.py --spec sweep.example.json
 uv run run_sweep.py --spec my_sweep.json --max-runs 5
 ```
+
+### Chain-of-thought alignment + reward-based fine-tuning
+
+`train.py` now includes a post-pretraining reasoning alignment stage:
+
+1. **SFT vaihe (ajatusketju):** malli opetetaan tuottamaan step-by-step-ratkaisuja yksinkertaisiin laskutehtäviin.
+2. **RL vaihe (palkkio/rangaistus):** mallin lopullista vastaustokenia optimoidaan REINFORCE-tyylisesti: oikeasta vastauksesta palkkio `+1`, väärästä `-1`.
+
+Tämän vaiheen tarkoitus on antaa mallille eksplisiittinen “ajattele ennen vastausta” -harjoitus sekä suora oikeellisuuteen kytketty oppimissignaali.
+
+Voit säätää tai poistaa vaiheen ympäristömuuttujilla:
+
+```bash
+# Disable reasoning alignment entirely
+AUTORESEARCH_REASONING_SFT_STEPS=0 AUTORESEARCH_REASONING_RL_STEPS=0 uv run train.py
+
+# Stronger reasoning training
+AUTORESEARCH_REASONING_SFT_STEPS=64 \
+AUTORESEARCH_REASONING_RL_STEPS=64 \
+AUTORESEARCH_REASONING_BATCH_SIZE=64 \
+AUTORESEARCH_REASONING_LR_FRAC=0.15 \
+uv run train.py
+```
+
+Reasoning-vaiheen asetukset:
+
+- `AUTORESEARCH_REASONING_SFT_STEPS`
+- `AUTORESEARCH_REASONING_RL_STEPS`
+- `AUTORESEARCH_REASONING_BATCH_SIZE`
+- `AUTORESEARCH_REASONING_SEQ_LEN`
+- `AUTORESEARCH_REASONING_LR_FRAC`
+- `AUTORESEARCH_REASONING_MAX_INT`
 
 ## Design choices
 
