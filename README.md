@@ -55,8 +55,127 @@ The `program.md` file is essentially a super lightweight "skill".
 prepare.py      — constants, data prep + runtime utilities (do not modify)
 train.py        — model, optimizer, training loop (agent modifies this)
 program.md      — agent instructions
+analyze_runs.py — leaderboard utility for JSON run summaries
+run_sweep.py    — multi-run orchestrator driven by JSON spec + env overrides
+sweep.example.json — example sweep specification
+record_benchmark_result.py — attach HLE + SWE-Bench Pro scores to run JSON
 pyproject.toml  — dependencies
 ```
+
+## Experiment tracking and analysis
+
+Each `uv run train.py` execution now writes a machine-readable JSON summary to `runs/`:
+
+- `runs/run_<timestamp>.json` — immutable summary for a specific run.
+- `runs/latest.json` — summary for the most recent run.
+
+This makes it easier for autonomous agents to compare experiments without brittle log parsing.
+
+You can analyze the best runs with:
+
+```bash
+uv run analyze_runs.py
+uv run analyze_runs.py --limit 20
+uv run analyze_runs.py --json
+```
+
+By default, summaries are written to `./runs`; override with `AUTORESEARCH_RUN_DIR=/path/to/runs`.
+
+### Hyperparameter overrides without editing code
+
+`train.py` supports environment-variable overrides so autonomous agents can run parameter sweeps without patching source each time.
+
+Examples:
+
+```bash
+AUTORESEARCH_DEPTH=10 AUTORESEARCH_WINDOW_PATTERN=L uv run train.py
+AUTORESEARCH_MATRIX_LR=0.03 AUTORESEARCH_WEIGHT_DECAY=0.1 uv run train.py
+AUTORESEARCH_ADAM_BETAS=0.85,0.98 uv run train.py
+```
+
+Available overrides:
+
+- `AUTORESEARCH_DEPTH`
+- `AUTORESEARCH_ASPECT_RATIO`
+- `AUTORESEARCH_HEAD_DIM`
+- `AUTORESEARCH_WINDOW_PATTERN`
+- `AUTORESEARCH_TOTAL_BATCH_SIZE`
+- `AUTORESEARCH_DEVICE_BATCH_SIZE`
+- `AUTORESEARCH_EMBEDDING_LR`
+- `AUTORESEARCH_UNEMBEDDING_LR`
+- `AUTORESEARCH_MATRIX_LR`
+- `AUTORESEARCH_SCALAR_LR`
+- `AUTORESEARCH_WEIGHT_DECAY`
+- `AUTORESEARCH_ADAM_BETAS` (format: `"0.8,0.95"`)
+- `AUTORESEARCH_WARMUP_RATIO`
+- `AUTORESEARCH_WARMDOWN_RATIO`
+- `AUTORESEARCH_FINAL_LR_FRAC`
+
+### Running a sweep
+
+For unattended experiments, you can run a sequence of trials from a JSON file:
+
+```bash
+uv run run_sweep.py --spec sweep.example.json
+uv run run_sweep.py --spec my_sweep.json --max-runs 5
+```
+
+### Chain-of-thought alignment + reward-based fine-tuning
+
+`train.py` now includes a post-pretraining reasoning alignment stage:
+
+1. **SFT vaihe (ajatusketju):** malli opetetaan tuottamaan step-by-step-ratkaisuja yksinkertaisiin laskutehtäviin.
+2. **RL vaihe (palkkio/rangaistus):** mallin lopullista vastaustokenia optimoidaan REINFORCE-tyylisesti: oikeasta vastauksesta palkkio `+1`, väärästä `-1`.
+
+Tämän vaiheen tarkoitus on antaa mallille eksplisiittinen “ajattele ennen vastausta” -harjoitus sekä suora oikeellisuuteen kytketty oppimissignaali.
+
+Voit säätää tai poistaa vaiheen ympäristömuuttujilla:
+
+```bash
+# Disable reasoning alignment entirely
+AUTORESEARCH_REASONING_SFT_STEPS=0 AUTORESEARCH_REASONING_RL_STEPS=0 uv run train.py
+
+# Stronger reasoning training
+AUTORESEARCH_REASONING_SFT_STEPS=64 \
+AUTORESEARCH_REASONING_RL_STEPS=64 \
+AUTORESEARCH_REASONING_BATCH_SIZE=64 \
+AUTORESEARCH_REASONING_LR_FRAC=0.15 \
+uv run train.py
+```
+
+Reasoning-vaiheen asetukset:
+
+- `AUTORESEARCH_REASONING_SFT_STEPS`
+- `AUTORESEARCH_REASONING_RL_STEPS`
+- `AUTORESEARCH_REASONING_BATCH_SIZE`
+- `AUTORESEARCH_REASONING_SEQ_LEN`
+- `AUTORESEARCH_REASONING_LR_FRAC`
+- `AUTORESEARCH_REASONING_MAX_INT`
+
+### Benchmark target tracking (HLE 64.7% / SWE-Bench Pro 77.8%)
+
+Repo now supports explicit target-aware tracking for:
+
+- **Humanity's Last Exam:** target `64.7%`
+- **SWE-Bench Pro:** target `77.8%`
+
+`train.py` writes these thresholds into each run summary. After you evaluate a trained checkpoint on external benchmark harnesses, attach the measured scores:
+
+```bash
+uv run record_benchmark_result.py \
+  --run-json runs/latest.json \
+  --hle 64.9 \
+  --swebench-pro 78.0 \
+  --in-place
+```
+
+Then rank runs by distance to targets:
+
+```bash
+uv run analyze_runs.py --sort-by target_gap
+```
+
+`target_gap` is zero only when both thresholds are reached/exceeded.
 
 ## Design choices
 
