@@ -483,6 +483,13 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
+# Reproducibility / evaluation stability
+SEED = 42
+REPRO_MODE = False
+USE_EMA = True
+EMA_DECAY = 0.999
+EMA_WARMUP_STEPS = 100
+
 # Optional post-training reasoning phase (small math tasks with SFT + reward-weighted updates)
 REASONING_ENABLE = True
 REASONING_BUDGET_SECONDS = 30
@@ -535,6 +542,44 @@ def _safe_git_commit():
         return "unknown"
 
 
+def init_ema_state(model):
+    """Snapshot model parameters for EMA tracking."""
+    return {
+        name: param.detach().clone()
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
+
+
+@torch.no_grad()
+def update_ema_state(model, ema_state, decay):
+    one_minus_decay = 1.0 - decay
+    for name, param in model.named_parameters():
+        if not param.requires_grad or name not in ema_state:
+            continue
+        ema_state[name].mul_(decay).add_(param.detach(), alpha=one_minus_decay)
+
+
+@torch.no_grad()
+def copy_ema_to_model(model, ema_state):
+    """Swap model params to EMA weights and return originals for restoration."""
+    backups = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad or name not in ema_state:
+            continue
+        backups[name] = param.detach().clone()
+        param.copy_(ema_state[name])
+    return backups
+
+
+@torch.no_grad()
+def restore_model_params(model, backups):
+    """Restore model params after temporary EMA evaluation."""
+    for name, param in model.named_parameters():
+        if name in backups:
+            param.copy_(backups[name])
+
+
 # Optional environment-based overrides for autonomous sweeps (no code edits required)
 ASPECT_RATIO = _env_int("AUTORESEARCH_ASPECT_RATIO", ASPECT_RATIO)
 HEAD_DIM = _env_int("AUTORESEARCH_HEAD_DIM", HEAD_DIM)
@@ -551,6 +596,11 @@ WARMDOWN_RATIO = _env_float("AUTORESEARCH_WARMDOWN_RATIO", WARMDOWN_RATIO)
 FINAL_LR_FRAC = _env_float("AUTORESEARCH_FINAL_LR_FRAC", FINAL_LR_FRAC)
 DEPTH = _env_int("AUTORESEARCH_DEPTH", DEPTH)
 DEVICE_BATCH_SIZE = _env_int("AUTORESEARCH_DEVICE_BATCH_SIZE", DEVICE_BATCH_SIZE)
+SEED = _env_int("AUTORESEARCH_SEED", SEED)
+REPRO_MODE = _env_bool("AUTORESEARCH_REPRO_MODE", REPRO_MODE)
+USE_EMA = _env_bool("AUTORESEARCH_USE_EMA", USE_EMA)
+EMA_DECAY = _env_float("AUTORESEARCH_EMA_DECAY", EMA_DECAY)
+EMA_WARMUP_STEPS = _env_int("AUTORESEARCH_EMA_WARMUP_STEPS", EMA_WARMUP_STEPS)
 REASONING_ENABLE = _env_bool("AUTORESEARCH_REASONING_ENABLE", REASONING_ENABLE)
 REASONING_BUDGET_SECONDS = _env_int("AUTORESEARCH_REASONING_BUDGET_SECONDS", REASONING_BUDGET_SECONDS)
 REASONING_SEQ_LEN = _env_int("AUTORESEARCH_REASONING_SEQ_LEN", REASONING_SEQ_LEN)
@@ -585,6 +635,7 @@ print(f"  DEPTH={DEPTH} ASPECT_RATIO={ASPECT_RATIO} HEAD_DIM={HEAD_DIM} WINDOW_P
 print(f"  TOTAL_BATCH_SIZE={TOTAL_BATCH_SIZE} DEVICE_BATCH_SIZE={DEVICE_BATCH_SIZE}")
 print(f"  EMBEDDING_LR={EMBEDDING_LR} UNEMBEDDING_LR={UNEMBEDDING_LR} MATRIX_LR={MATRIX_LR} SCALAR_LR={SCALAR_LR}")
 print(f"  WEIGHT_DECAY={WEIGHT_DECAY} ADAM_BETAS={ADAM_BETAS} WARMUP_RATIO={WARMUP_RATIO} WARMDOWN_RATIO={WARMDOWN_RATIO} FINAL_LR_FRAC={FINAL_LR_FRAC}")
+print(f"  SEED={SEED} REPRO_MODE={REPRO_MODE} USE_EMA={USE_EMA} EMA_DECAY={EMA_DECAY} EMA_WARMUP_STEPS={EMA_WARMUP_STEPS}")
 print(f"  REASONING_ENABLE={REASONING_ENABLE} REASONING_BUDGET_SECONDS={REASONING_BUDGET_SECONDS} REASONING_SFT_STEPS={REASONING_SFT_STEPS} REASONING_RL_STEPS={REASONING_RL_STEPS}")
 
 
