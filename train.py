@@ -434,6 +434,33 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
+
+def _env_bool(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean for {name}: {raw!r}")
+
+
+def _env_int(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else int(raw)
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else float(raw)
+
+
+def _env_str(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else raw
+
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
@@ -526,9 +553,13 @@ REASONING_MAX_TOKENS = _env_int("AUTORESEARCH_REASONING_MAX_TOKENS", 256)
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
 torch.set_float32_matmul_precision("high")
+if REPRO_MODE:
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 H100_BF16_PEAK_FLOPS = 989.5e12
@@ -684,8 +715,58 @@ def build_model_config(depth):
         window_pattern=WINDOW_PATTERN,
     )
 
+
+def init_ema_state(model_for_ema):
+    return [p.detach().clone() for p in model_for_ema.parameters()]
+
+
+@torch.no_grad()
+def update_ema_state(model_for_ema, ema_state, decay):
+    for ema_param, model_param in zip(ema_state, model_for_ema.parameters()):
+        ema_param.mul_(decay).add_(model_param.detach(), alpha=(1.0 - decay))
+
+
+@torch.no_grad()
+def copy_ema_to_model(model_for_ema, ema_state):
+    backups = []
+    for model_param, ema_param in zip(model_for_ema.parameters(), ema_state):
+        backups.append(model_param.detach().clone())
+        model_param.copy_(ema_param)
+    return backups
+
+
+@torch.no_grad()
+def restore_model_params(model_for_ema, backups):
+    for model_param, original in zip(model_for_ema.parameters(), backups):
+        model_param.copy_(original)
+
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
+
+def get_git_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def maybe_write_run_artifacts(summary):
+    summary_path = os.environ.get("AUTORESEARCH_SUMMARY_PATH")
+    if summary_path:
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+            f.write("\n")
+        print(f"summary_path:      {summary_path}")
+
+    metrics_path = os.environ.get("AUTORESEARCH_METRICS_JSONL")
+    if metrics_path:
+        with open(metrics_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(summary, sort_keys=True) + "\n")
+        print(f"metrics_jsonl:     {metrics_path}")
 
 with torch.device("meta"):
     model = GPT(config)
@@ -713,10 +794,13 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
+raw_model = model
 model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
+ema_state = init_ema_state(model) if USE_EMA else None
+ema_updates = 0
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -738,6 +822,130 @@ def get_muon_momentum(step):
 
 def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)
+
+
+def make_reasoning_batch(batch_size):
+    """
+    Build synthetic arithmetic prompts with explicit CoT requirement.
+    """
+    samples = []
+    for _ in range(batch_size):
+        a = random.randint(2, 99)
+        b = random.randint(2, 99)
+        op = random.choice(["+", "-", "*"])
+        if op == "+":
+            ans = a + b
+        elif op == "-":
+            ans = a - b
+        else:
+            ans = a * b
+        prompt = (
+            "Solve the problem. Think step by step inside <think>...</think> and end with "
+            "<answer>NUMBER</answer>.\n"
+            f"Question: {a} {op} {b}\n"
+            "Response:\n"
+        )
+        samples.append((prompt, str(ans)))
+    return samples
+
+
+def extract_answer(text):
+    m = re.search(r"<answer>\s*(-?\d+)\s*</answer>", text)
+    return m.group(1) if m else None
+
+
+def sample_with_logprobs(model_for_sampling, prompt_ids, max_new_tokens):
+    """
+    Sample continuation tokens first (without graph retention), then compute a
+    single differentiable policy term from a teacher-forced forward pass.
+    """
+    sampled = []
+    x = torch.tensor(prompt_ids, dtype=torch.long, device=device)[None, :]
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            logits = model_for_sampling(x)
+            logits_last = logits[:, -1, :]
+            probs = F.softmax(logits_last, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            sampled.append(next_token.item())
+            x = torch.cat([x, next_token], dim=1)
+            if next_token.item() == tokenizer.get_bos_token_id():
+                break
+
+    if not sampled:
+        return sampled, None
+
+    full_ids = torch.tensor(prompt_ids + sampled, dtype=torch.long, device=device)[None, :]
+    logits = model_for_sampling(full_ids)
+    sampled_start = len(prompt_ids) - 1
+    sampled_end = sampled_start + len(sampled)
+    logits_for_sampled = logits[:, sampled_start:sampled_end, :]
+    target_tokens = full_ids[:, len(prompt_ids):]
+    token_logprobs = F.log_softmax(logits_for_sampled, dim=-1).gather(
+        -1, target_tokens.unsqueeze(-1)
+    ).squeeze(-1)
+    sample_policy_term = token_logprobs.mean()
+    return sampled, sample_policy_term
+
+
+def run_reasoning_rl_phase(model_for_rl):
+    if REASONING_RL_ENABLED <= 0 or REASONING_RL_STEPS <= 0:
+        return {"enabled": False}
+    print("---")
+    print("reasoning_rl: starting policy-gradient phase")
+    model_for_rl.train()
+    rl_optimizer = torch.optim.AdamW(model_for_rl.parameters(), lr=REASONING_RL_LR, betas=(0.9, 0.99), weight_decay=0.0)
+    reward_history = []
+    accuracy_history = []
+    cot_history = []
+
+    for rl_step in range(REASONING_RL_STEPS):
+        batch = make_reasoning_batch(REASONING_RL_BATCH_SIZE)
+        sample_terms = []
+        rewards = []
+        correct = 0
+        cot_present = 0
+        for prompt, gold_answer in batch:
+            prompt_ids = tokenizer.encode(prompt, prepend=tokenizer.get_bos_token_id())
+            sampled_ids, sample_policy_term = sample_with_logprobs(model_for_rl, prompt_ids, REASONING_RL_MAX_NEW_TOKENS)
+            if sample_policy_term is None:
+                continue
+            completion = tokenizer.decode(sampled_ids)
+            pred_answer = extract_answer(completion)
+            has_cot = int("<think>" in completion and "</think>" in completion)
+            is_correct = int(pred_answer == gold_answer)
+            reward = 1.0 * is_correct - 1.0 * (1 - is_correct) + 0.2 * has_cot
+            sample_terms.append(sample_policy_term)
+            rewards.append(reward)
+            correct += is_correct
+            cot_present += has_cot
+
+        if not sample_terms:
+            continue
+        reward_tensor = torch.tensor(rewards, device=device, dtype=torch.float32)
+        advantage = reward_tensor - reward_tensor.mean()
+        policy_terms = torch.stack(sample_terms)
+        rl_loss = -(advantage * policy_terms).mean()
+        rl_optimizer.zero_grad(set_to_none=True)
+        rl_loss.backward()
+        rl_optimizer.step()
+        avg_reward = float(reward_tensor.mean().item())
+        acc = correct / max(1, len(rewards))
+        cot_rate = cot_present / max(1, len(rewards))
+        reward_history.append(avg_reward)
+        accuracy_history.append(acc)
+        cot_history.append(cot_rate)
+        print(f"reasoning_rl step {rl_step+1:03d}/{REASONING_RL_STEPS} | reward: {avg_reward:+.3f} | acc: {acc:.2f} | cot_rate: {cot_rate:.2f}")
+
+    if not reward_history:
+        return {"enabled": True, "steps": 0}
+    return {
+        "enabled": True,
+        "steps": len(reward_history),
+        "avg_reward": float(sum(reward_history) / len(reward_history)),
+        "avg_accuracy": float(sum(accuracy_history) / len(accuracy_history)),
+        "avg_cot_rate": float(sum(cot_history) / len(cot_history)),
+    }
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -771,6 +979,9 @@ while True:
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    if ema_state is not None and step >= EMA_WARMUP_STEPS:
+        update_ema_state(model, ema_state, EMA_DECAY)
+        ema_updates += 1
 
     train_loss_f = train_loss.item()
 
@@ -825,7 +1036,14 @@ if REASONING_PHASE_ENABLED:
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb_raw = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+val_bpb_ema = None
+if ema_state is not None and ema_updates > 0:
+    backups = copy_ema_to_model(model, ema_state)
+    with autocast_ctx:
+        val_bpb_ema = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    restore_model_params(model, backups)
+val_bpb = min(val_bpb_raw, val_bpb_ema) if val_bpb_ema is not None else val_bpb_raw
 
 # Final summary
 t_end = time.time()
@@ -833,8 +1051,46 @@ startup_time = t_start_training - t_start
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
+summary = {
+    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    "git_commit": get_git_commit(),
+    "seed": SEED,
+    "repro_mode": REPRO_MODE,
+    "torch_version": torch.__version__,
+    "cuda_device": torch.cuda.get_device_name(),
+    "model_config": asdict(config),
+    "hparams": {
+        "aspect_ratio": ASPECT_RATIO,
+        "head_dim": HEAD_DIM,
+        "window_pattern": WINDOW_PATTERN,
+        "total_batch_size": TOTAL_BATCH_SIZE,
+        "device_batch_size": DEVICE_BATCH_SIZE,
+        "embedding_lr": EMBEDDING_LR,
+        "unembedding_lr": UNEMBEDDING_LR,
+        "matrix_lr": MATRIX_LR,
+        "scalar_lr": SCALAR_LR,
+        "weight_decay": WEIGHT_DECAY,
+        "adam_betas": ADAM_BETAS,
+        "warmup_ratio": WARMUP_RATIO,
+        "warmdown_ratio": WARMDOWN_RATIO,
+        "final_lr_frac": FINAL_LR_FRAC,
+        "depth": DEPTH,
+    },
+    "metrics": {
+        "val_bpb": round(val_bpb, 6),
+        "training_seconds": round(total_training_time, 1),
+        "total_seconds": round(t_end - t_start, 1),
+        "peak_vram_mb": round(peak_vram_mb, 1),
+        "mfu_percent": round(steady_state_mfu, 2),
+        "total_tokens_m": round(total_tokens / 1e6, 1),
+        "num_steps": step,
+        "num_params_m": round(num_params / 1e6, 1),
+    },
+}
+
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
+print(f"startup_seconds:  {startup_time:.1f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
