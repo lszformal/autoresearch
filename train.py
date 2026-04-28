@@ -825,7 +825,7 @@ def _logprob_for_generated_tokens(model, full_ids, prompt_len):
     return generated.sum()
 
 
-def run_reasoning_phase(model, optimizer, tokenizer):
+def run_reasoning_phase(model, optimizer, tokenizer, ema_state=None, ema_updates=0, train_step=0):
     if not REASONING_ENABLE or REASONING_BUDGET_SECONDS <= 0:
         return {"enabled": False}
 
@@ -844,6 +844,9 @@ def run_reasoning_phase(model, optimizer, tokenizer):
             sft_loss = model(x_sft, y_sft)
         sft_loss.backward()
         optimizer.step()
+        if ema_state is not None and train_step >= EMA_WARMUP_STEPS:
+            update_ema_state(model, ema_state, EMA_DECAY)
+            ema_updates += 1
         model.zero_grad(set_to_none=True)
         sft_steps_done += 1
 
@@ -878,6 +881,9 @@ def run_reasoning_phase(model, optimizer, tokenizer):
         rl_loss = rl_loss / max(len(batch_items), 1)
         rl_loss.backward()
         optimizer.step()
+        if ema_state is not None and train_step >= EMA_WARMUP_STEPS:
+            update_ema_state(model, ema_state, EMA_DECAY)
+            ema_updates += 1
         model.zero_grad(set_to_none=True)
         rl_steps_done += 1
 
@@ -893,6 +899,7 @@ def run_reasoning_phase(model, optimizer, tokenizer):
         "rl_steps": int(rl_steps_done),
         "rl_accuracy": float(rl_accuracy),
         "avg_reward": float(avg_reward),
+        "ema_updates": int(ema_updates),
     }
 
 # ---------------------------------------------------------------------------
@@ -974,7 +981,15 @@ print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
-reasoning_stats = run_reasoning_phase(model, optimizer, tokenizer)
+reasoning_stats = run_reasoning_phase(
+    model,
+    optimizer,
+    tokenizer,
+    ema_state=ema_state,
+    ema_updates=ema_updates,
+    train_step=step,
+)
+ema_updates = reasoning_stats.pop("ema_updates", ema_updates)
 
 # Final eval
 model.eval()
