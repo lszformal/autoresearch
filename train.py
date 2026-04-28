@@ -483,23 +483,19 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
-# Reproducibility / evaluation stability
-SEED = 42
-REPRO_MODE = False
-USE_EMA = True
+# Reproducibility / evaluation
+SEED = 1337
+REPRO_MODE = 0
+USE_EMA = 1
 EMA_DECAY = 0.999
 EMA_WARMUP_STEPS = 100
 
-# Optional post-training reasoning phase (small math tasks with SFT + reward-weighted updates)
-REASONING_ENABLE = True
-REASONING_BUDGET_SECONDS = 30
-REASONING_SEQ_LEN = 128
-REASONING_SFT_BATCH_SIZE = 16
-REASONING_SFT_STEPS = 16
-REASONING_RL_STEPS = 16
-REASONING_RL_BATCH_SIZE = 8
-REASONING_RL_MAX_NEW_TOKENS = 40
-REASONING_LR_MULT = 0.25
+# Post-pretraining reasoning phase (policy gradient)
+REASONING_RL_ENABLED = 1
+REASONING_RL_STEPS = 12
+REASONING_RL_BATCH_SIZE = 4
+REASONING_RL_MAX_NEW_TOKENS = 64
+REASONING_RL_LR = 1e-6
 
 
 def _env_str(name, default):
@@ -526,13 +522,6 @@ def _env_betas(name, default):
     return (float(chunks[0]), float(chunks[1]))
 
 
-def _env_bool(name, default):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
 def _safe_git_commit():
     """Best-effort current git commit for reproducibility metadata."""
     try:
@@ -540,44 +529,6 @@ def _safe_git_commit():
         return out.strip()
     except Exception:
         return "unknown"
-
-
-def init_ema_state(model):
-    """Snapshot model parameters for EMA tracking."""
-    return {
-        name: param.detach().clone()
-        for name, param in model.named_parameters()
-        if param.requires_grad
-    }
-
-
-@torch.no_grad()
-def update_ema_state(model, ema_state, decay):
-    one_minus_decay = 1.0 - decay
-    for name, param in model.named_parameters():
-        if not param.requires_grad or name not in ema_state:
-            continue
-        ema_state[name].mul_(decay).add_(param.detach(), alpha=one_minus_decay)
-
-
-@torch.no_grad()
-def copy_ema_to_model(model, ema_state):
-    """Swap model params to EMA weights and return originals for restoration."""
-    backups = {}
-    for name, param in model.named_parameters():
-        if not param.requires_grad or name not in ema_state:
-            continue
-        backups[name] = param.detach().clone()
-        param.copy_(ema_state[name])
-    return backups
-
-
-@torch.no_grad()
-def restore_model_params(model, backups):
-    """Restore model params after temporary EMA evaluation."""
-    for name, param in model.named_parameters():
-        if name in backups:
-            param.copy_(backups[name])
 
 
 # Optional environment-based overrides for autonomous sweeps (no code edits required)
@@ -597,19 +548,15 @@ FINAL_LR_FRAC = _env_float("AUTORESEARCH_FINAL_LR_FRAC", FINAL_LR_FRAC)
 DEPTH = _env_int("AUTORESEARCH_DEPTH", DEPTH)
 DEVICE_BATCH_SIZE = _env_int("AUTORESEARCH_DEVICE_BATCH_SIZE", DEVICE_BATCH_SIZE)
 SEED = _env_int("AUTORESEARCH_SEED", SEED)
-REPRO_MODE = _env_bool("AUTORESEARCH_REPRO_MODE", REPRO_MODE)
-USE_EMA = _env_bool("AUTORESEARCH_USE_EMA", USE_EMA)
+REPRO_MODE = _env_bool("AUTORESEARCH_REPRO_MODE", bool(REPRO_MODE))
+USE_EMA = _env_bool("AUTORESEARCH_USE_EMA", bool(USE_EMA))
 EMA_DECAY = _env_float("AUTORESEARCH_EMA_DECAY", EMA_DECAY)
 EMA_WARMUP_STEPS = _env_int("AUTORESEARCH_EMA_WARMUP_STEPS", EMA_WARMUP_STEPS)
-REASONING_ENABLE = _env_bool("AUTORESEARCH_REASONING_ENABLE", REASONING_ENABLE)
-REASONING_BUDGET_SECONDS = _env_int("AUTORESEARCH_REASONING_BUDGET_SECONDS", REASONING_BUDGET_SECONDS)
-REASONING_SEQ_LEN = _env_int("AUTORESEARCH_REASONING_SEQ_LEN", REASONING_SEQ_LEN)
-REASONING_SFT_BATCH_SIZE = _env_int("AUTORESEARCH_REASONING_SFT_BATCH_SIZE", REASONING_SFT_BATCH_SIZE)
-REASONING_SFT_STEPS = _env_int("AUTORESEARCH_REASONING_SFT_STEPS", REASONING_SFT_STEPS)
+REASONING_RL_ENABLED = _env_int("AUTORESEARCH_REASONING_RL_ENABLED", REASONING_RL_ENABLED)
 REASONING_RL_STEPS = _env_int("AUTORESEARCH_REASONING_RL_STEPS", REASONING_RL_STEPS)
 REASONING_RL_BATCH_SIZE = _env_int("AUTORESEARCH_REASONING_RL_BATCH_SIZE", REASONING_RL_BATCH_SIZE)
 REASONING_RL_MAX_NEW_TOKENS = _env_int("AUTORESEARCH_REASONING_RL_MAX_NEW_TOKENS", REASONING_RL_MAX_NEW_TOKENS)
-REASONING_LR_MULT = _env_float("AUTORESEARCH_REASONING_LR_MULT", REASONING_LR_MULT)
+REASONING_RL_LR = _env_float("AUTORESEARCH_REASONING_RL_LR", REASONING_RL_LR)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -636,7 +583,7 @@ print(f"  TOTAL_BATCH_SIZE={TOTAL_BATCH_SIZE} DEVICE_BATCH_SIZE={DEVICE_BATCH_SI
 print(f"  EMBEDDING_LR={EMBEDDING_LR} UNEMBEDDING_LR={UNEMBEDDING_LR} MATRIX_LR={MATRIX_LR} SCALAR_LR={SCALAR_LR}")
 print(f"  WEIGHT_DECAY={WEIGHT_DECAY} ADAM_BETAS={ADAM_BETAS} WARMUP_RATIO={WARMUP_RATIO} WARMDOWN_RATIO={WARMDOWN_RATIO} FINAL_LR_FRAC={FINAL_LR_FRAC}")
 print(f"  SEED={SEED} REPRO_MODE={REPRO_MODE} USE_EMA={USE_EMA} EMA_DECAY={EMA_DECAY} EMA_WARMUP_STEPS={EMA_WARMUP_STEPS}")
-print(f"  REASONING_ENABLE={REASONING_ENABLE} REASONING_BUDGET_SECONDS={REASONING_BUDGET_SECONDS} REASONING_SFT_STEPS={REASONING_SFT_STEPS} REASONING_RL_STEPS={REASONING_RL_STEPS}")
+print(f"  REASONING_RL_ENABLED={REASONING_RL_ENABLED} REASONING_RL_STEPS={REASONING_RL_STEPS} REASONING_RL_BATCH_SIZE={REASONING_RL_BATCH_SIZE} REASONING_RL_LR={REASONING_RL_LR}")
 
 
 def save_run_summary(summary):
@@ -663,6 +610,31 @@ def build_model_config(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )
+
+
+def init_ema_state(model_for_ema):
+    return [p.detach().clone() for p in model_for_ema.parameters()]
+
+
+@torch.no_grad()
+def update_ema_state(model_for_ema, ema_state, decay):
+    for ema_param, model_param in zip(ema_state, model_for_ema.parameters()):
+        ema_param.mul_(decay).add_(model_param.detach(), alpha=(1.0 - decay))
+
+
+@torch.no_grad()
+def copy_ema_to_model(model_for_ema, ema_state):
+    backups = []
+    for model_param, ema_param in zip(model_for_ema.parameters(), ema_state):
+        backups.append(model_param.detach().clone())
+        model_param.copy_(ema_param)
+    return backups
+
+
+@torch.no_grad()
+def restore_model_params(model_for_ema, backups):
+    for model_param, original in zip(model_for_ema.parameters(), backups):
+        model_param.copy_(original)
 
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
@@ -718,6 +690,7 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
+raw_model = model
 model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
@@ -747,159 +720,127 @@ def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)
 
 
-def _sample_math_problem():
-    ops = ["+", "-", "*"]
-    op = random.choice(ops)
-    if op == "+":
-        a, b = random.randint(0, 999), random.randint(0, 999)
-        y = a + b
-    elif op == "-":
-        a, b = random.randint(0, 999), random.randint(0, 999)
-        y = a - b
-    else:
-        a, b = random.randint(0, 99), random.randint(0, 99)
-        y = a * b
-    return a, op, b, y
+def make_reasoning_batch(batch_size):
+    """
+    Build synthetic arithmetic prompts with explicit CoT requirement.
+    """
+    samples = []
+    for _ in range(batch_size):
+        a = random.randint(2, 99)
+        b = random.randint(2, 99)
+        op = random.choice(["+", "-", "*"])
+        if op == "+":
+            ans = a + b
+        elif op == "-":
+            ans = a - b
+        else:
+            ans = a * b
+        prompt = (
+            "Solve the problem. Think step by step inside <think>...</think> and end with "
+            "<answer>NUMBER</answer>.\n"
+            f"Question: {a} {op} {b}\n"
+            "Response:\n"
+        )
+        samples.append((prompt, str(ans)))
+    return samples
 
 
-def _reasoning_text(a, op, b, y):
-    return (
-        f"Question: {a} {op} {b}\n"
-        f"<think>{a} {op} {b} = {y}</think>\n"
-        f"Answer: {y}"
-    )
+def extract_answer(text):
+    m = re.search(r"<answer>\s*(-?\d+)\s*</answer>", text)
+    return m.group(1) if m else None
 
 
-def build_reasoning_sft_batch(tokenizer, batch_size, seq_len, device):
-    bos = tokenizer.get_bos_token_id()
-    xs = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
-    ys = torch.full((batch_size, seq_len), -1, dtype=torch.long, device=device)
-    for i in range(batch_size):
-        a, op, b, y = _sample_math_problem()
-        ids = tokenizer.encode(_reasoning_text(a, op, b, y), prepend=bos)
-        ids = ids[:seq_len + 1]
-        if len(ids) < 2:
-            continue
-        x_ids = ids[:-1]
-        y_ids = ids[1:]
-        n = min(len(x_ids), seq_len)
-        xs[i, :n] = torch.tensor(x_ids[:n], dtype=torch.long, device=device)
-        ys[i, :n] = torch.tensor(y_ids[:n], dtype=torch.long, device=device)
-    return xs, ys
+def sample_with_logprobs(model_for_sampling, prompt_ids, max_new_tokens):
+    """
+    Sample continuation tokens first (without graph retention), then compute a
+    single differentiable policy term from a teacher-forced forward pass.
+    """
+    sampled = []
+    x = torch.tensor(prompt_ids, dtype=torch.long, device=device)[None, :]
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            logits = model_for_sampling(x)
+            logits_last = logits[:, -1, :]
+            probs = F.softmax(logits_last, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            sampled.append(next_token.item())
+            x = torch.cat([x, next_token], dim=1)
+            if next_token.item() == tokenizer.get_bos_token_id():
+                break
+
+    if not sampled:
+        return sampled, None
+
+    full_ids = torch.tensor(prompt_ids + sampled, dtype=torch.long, device=device)[None, :]
+    logits = model_for_sampling(full_ids)
+    sampled_start = len(prompt_ids) - 1
+    sampled_end = sampled_start + len(sampled)
+    logits_for_sampled = logits[:, sampled_start:sampled_end, :]
+    target_tokens = full_ids[:, len(prompt_ids):]
+    token_logprobs = F.log_softmax(logits_for_sampled, dim=-1).gather(
+        -1, target_tokens.unsqueeze(-1)
+    ).squeeze(-1)
+    sample_policy_term = token_logprobs.mean()
+    return sampled, sample_policy_term
 
 
-def _parse_answer(text):
-    m = re.search(r"Answer:\s*(-?\d+)", text)
-    if m is None:
-        return None
-    try:
-        return int(m.group(1))
-    except ValueError:
-        return None
-
-
-@torch.no_grad()
-def _sample_sequence(model, tokenizer, prompt_ids, max_new_tokens):
-    ids = prompt_ids[:]
-    for _ in range(max_new_tokens):
-        x = torch.tensor([ids], dtype=torch.long, device=device)
-        with autocast_ctx:
-            logits = model(x)
-        next_logits = logits[0, -1]
-        probs = F.softmax(next_logits, dim=-1)
-        next_id = torch.multinomial(probs, num_samples=1).item()
-        ids.append(next_id)
-        if next_id == tokenizer.get_bos_token_id():
-            break
-    return ids
-
-
-def _logprob_for_generated_tokens(model, full_ids, prompt_len):
-    x = torch.tensor([full_ids[:-1]], dtype=torch.long, device=device)
-    y = torch.tensor([full_ids[1:]], dtype=torch.long, device=device)
-    with autocast_ctx:
-        logits = model(x)
-    log_probs = F.log_softmax(logits, dim=-1)
-    selected = log_probs.gather(-1, y.unsqueeze(-1)).squeeze(-1)
-    generated = selected[:, prompt_len - 1:]
-    return generated.sum()
-
-
-def run_reasoning_phase(model, optimizer, tokenizer, ema_state=None, ema_updates=0, train_step=0):
-    if not REASONING_ENABLE or REASONING_BUDGET_SECONDS <= 0:
+def run_reasoning_rl_phase(model_for_rl):
+    if REASONING_RL_ENABLED <= 0 or REASONING_RL_STEPS <= 0:
         return {"enabled": False}
+    print("---")
+    print("reasoning_rl: starting policy-gradient phase")
+    model_for_rl.train()
+    rl_optimizer = torch.optim.AdamW(model_for_rl.parameters(), lr=REASONING_RL_LR, betas=(0.9, 0.99), weight_decay=0.0)
+    reward_history = []
+    accuracy_history = []
+    cot_history = []
 
-    print("\n---")
-    print("Starting reasoning phase (SFT + reward-weighted fine-tuning)")
-    t0 = time.time()
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * REASONING_LR_MULT
-
-    sft_steps_done = 0
-    for _ in range(REASONING_SFT_STEPS):
-        if time.time() - t0 >= REASONING_BUDGET_SECONDS:
-            break
-        x_sft, y_sft = build_reasoning_sft_batch(tokenizer, REASONING_SFT_BATCH_SIZE, REASONING_SEQ_LEN, device)
-        with autocast_ctx:
-            sft_loss = model(x_sft, y_sft)
-        sft_loss.backward()
-        optimizer.step()
-        if ema_state is not None and train_step >= EMA_WARMUP_STEPS:
-            update_ema_state(model, ema_state, EMA_DECAY)
-            ema_updates += 1
-        model.zero_grad(set_to_none=True)
-        sft_steps_done += 1
-
-    rl_steps_done = 0
-    reward_sum = 0.0
-    accuracy_sum = 0.0
-    for _ in range(REASONING_RL_STEPS):
-        if time.time() - t0 >= REASONING_BUDGET_SECONDS:
-            break
-        batch_items = []
+    for rl_step in range(REASONING_RL_STEPS):
+        batch = make_reasoning_batch(REASONING_RL_BATCH_SIZE)
+        sample_terms = []
         rewards = []
-        for _ in range(REASONING_RL_BATCH_SIZE):
-            a, op, b, y = _sample_math_problem()
-            prompt = f"Question: {a} {op} {b}\n<think>"
+        correct = 0
+        cot_present = 0
+        for prompt, gold_answer in batch:
             prompt_ids = tokenizer.encode(prompt, prepend=tokenizer.get_bos_token_id())
-            sampled_ids = _sample_sequence(model, tokenizer, prompt_ids, REASONING_RL_MAX_NEW_TOKENS)
-            text = tokenizer.decode(sampled_ids)
-            parsed = _parse_answer(text)
-            correct = parsed == y
-            reward = 1.0 if correct else -1.0
+            sampled_ids, sample_policy_term = sample_with_logprobs(model_for_rl, prompt_ids, REASONING_RL_MAX_NEW_TOKENS)
+            if sample_policy_term is None:
+                continue
+            completion = tokenizer.decode(sampled_ids)
+            pred_answer = extract_answer(completion)
+            has_cot = int("<think>" in completion and "</think>" in completion)
+            is_correct = int(pred_answer == gold_answer)
+            reward = 1.0 * is_correct - 1.0 * (1 - is_correct) + 0.2 * has_cot
+            sample_terms.append(sample_policy_term)
             rewards.append(reward)
-            batch_items.append((sampled_ids, len(prompt_ids)))
-            reward_sum += reward
-            accuracy_sum += 1.0 if correct else 0.0
+            correct += is_correct
+            cot_present += has_cot
 
-        reward_baseline = sum(rewards) / max(len(rewards), 1)
-        rl_loss = torch.tensor(0.0, device=device)
-        for (ids, prompt_len), reward in zip(batch_items, rewards):
-            advantage = reward - reward_baseline
-            logp = _logprob_for_generated_tokens(model, ids, prompt_len)
-            rl_loss = rl_loss + (-advantage * logp)
-        rl_loss = rl_loss / max(len(batch_items), 1)
+        if not sample_terms:
+            continue
+        reward_tensor = torch.tensor(rewards, device=device, dtype=torch.float32)
+        advantage = reward_tensor - reward_tensor.mean()
+        policy_terms = torch.stack(sample_terms)
+        rl_loss = -(advantage * policy_terms).mean()
+        rl_optimizer.zero_grad(set_to_none=True)
         rl_loss.backward()
-        optimizer.step()
-        if ema_state is not None and train_step >= EMA_WARMUP_STEPS:
-            update_ema_state(model, ema_state, EMA_DECAY)
-            ema_updates += 1
-        model.zero_grad(set_to_none=True)
-        rl_steps_done += 1
+        rl_optimizer.step()
+        avg_reward = float(reward_tensor.mean().item())
+        acc = correct / max(1, len(rewards))
+        cot_rate = cot_present / max(1, len(rewards))
+        reward_history.append(avg_reward)
+        accuracy_history.append(acc)
+        cot_history.append(cot_rate)
+        print(f"reasoning_rl step {rl_step+1:03d}/{REASONING_RL_STEPS} | reward: {avg_reward:+.3f} | acc: {acc:.2f} | cot_rate: {cot_rate:.2f}")
 
-    elapsed = time.time() - t0
-    count = rl_steps_done * REASONING_RL_BATCH_SIZE
-    rl_accuracy = (accuracy_sum / count) if count > 0 else 0.0
-    avg_reward = (reward_sum / count) if count > 0 else 0.0
-    print(f"Reasoning phase done in {elapsed:.1f}s | sft_steps={sft_steps_done} rl_steps={rl_steps_done} rl_accuracy={rl_accuracy:.3f} avg_reward={avg_reward:.3f}")
+    if not reward_history:
+        return {"enabled": True, "steps": 0}
     return {
         "enabled": True,
-        "elapsed_seconds": float(elapsed),
-        "sft_steps": int(sft_steps_done),
-        "rl_steps": int(rl_steps_done),
-        "rl_accuracy": float(rl_accuracy),
-        "avg_reward": float(avg_reward),
-        "ema_updates": int(ema_updates),
+        "steps": len(reward_history),
+        "avg_reward": float(sum(reward_history) / len(reward_history)),
+        "avg_accuracy": float(sum(accuracy_history) / len(accuracy_history)),
+        "avg_cot_rate": float(sum(cot_history) / len(cot_history)),
     }
 
 # ---------------------------------------------------------------------------
@@ -981,15 +922,8 @@ print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
-reasoning_stats = run_reasoning_phase(
-    model,
-    optimizer,
-    tokenizer,
-    ema_state=ema_state,
-    ema_updates=ema_updates,
-    train_step=step,
-)
-ema_updates = reasoning_stats.pop("ema_updates", ema_updates)
+# Post-pretraining reasoning RL
+reasoning_rl = run_reasoning_rl_phase(raw_model)
 
 # Final eval
 model.eval()
@@ -1057,6 +991,12 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+if reasoning_rl.get("enabled"):
+    print(f"reasoning_rl_steps:   {reasoning_rl.get('steps', 0)}")
+    if "avg_reward" in reasoning_rl:
+        print(f"reasoning_rl_reward:  {reasoning_rl['avg_reward']:+.3f}")
+        print(f"reasoning_rl_acc:     {reasoning_rl['avg_accuracy']:.3f}")
+        print(f"reasoning_rl_cot:     {reasoning_rl['avg_cot_rate']:.3f}")
 
 run_summary = {
     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -1090,17 +1030,6 @@ run_summary = {
         "warmdown_ratio": float(WARMDOWN_RATIO),
         "final_lr_frac": float(FINAL_LR_FRAC),
     },
-    "reasoning": {
-        "enabled": bool(REASONING_ENABLE),
-        "budget_seconds": int(REASONING_BUDGET_SECONDS),
-        "seq_len": int(REASONING_SEQ_LEN),
-        "sft_batch_size": int(REASONING_SFT_BATCH_SIZE),
-        "sft_steps_target": int(REASONING_SFT_STEPS),
-        "rl_steps_target": int(REASONING_RL_STEPS),
-        "rl_batch_size": int(REASONING_RL_BATCH_SIZE),
-        "rl_max_new_tokens": int(REASONING_RL_MAX_NEW_TOKENS),
-        "lr_mult": float(REASONING_LR_MULT),
-        "stats": reasoning_stats,
-    },
+    "reasoning_rl": reasoning_rl,
 }
 save_run_summary(run_summary)

@@ -8,23 +8,14 @@ Usage:
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 
 def load_runs(run_dir: Path):
     runs = []
     for path in sorted(run_dir.glob("run_*.json")):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
-            print(f"Warning: skipping unreadable run summary {path}: {exc}", file=sys.stderr)
-            continue
-        if not isinstance(payload, dict):
-            print(f"Warning: skipping invalid run summary {path}: expected JSON object", file=sys.stderr)
-            continue
-        # Keep metadata JSON-serializable so `--json` output never fails.
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
         payload["_path"] = str(path)
         runs.append(payload)
     return runs

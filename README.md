@@ -145,29 +145,11 @@ Available overrides:
 - `AUTORESEARCH_WARMUP_RATIO`
 - `AUTORESEARCH_WARMDOWN_RATIO`
 - `AUTORESEARCH_FINAL_LR_FRAC`
-- `AUTORESEARCH_REASONING_ENABLE` (`true/false`)
-- `AUTORESEARCH_REASONING_BUDGET_SECONDS`
-- `AUTORESEARCH_REASONING_SEQ_LEN`
-- `AUTORESEARCH_REASONING_SFT_BATCH_SIZE`
-- `AUTORESEARCH_REASONING_SFT_STEPS`
+- `AUTORESEARCH_REASONING_RL_ENABLED` (1/0)
 - `AUTORESEARCH_REASONING_RL_STEPS`
 - `AUTORESEARCH_REASONING_RL_BATCH_SIZE`
 - `AUTORESEARCH_REASONING_RL_MAX_NEW_TOKENS`
-- `AUTORESEARCH_REASONING_LR_MULT`
-
-### Reasoning phase (chain-of-thought style + reward fine-tuning)
-
-After the main pretraining time-budget run, `train.py` can execute a short reasoning phase:
-
-1. **SFT stage** on synthetic arithmetic prompts formatted with an explicit reasoning block:
-   - `Question: ...`
-   - `<think> ... </think>`
-   - `Answer: ...`
-2. **Reward-weighted stage** (policy-gradient style) where sampled completions are:
-   - rewarded with **+1** if parsed final answer is correct,
-   - penalized with **-1** if answer is wrong or missing.
-
-This phase is controlled by the `AUTORESEARCH_REASONING_*` environment variables above and logged into the JSON run summary under the `"reasoning"` key.
+- `AUTORESEARCH_REASONING_RL_LR`
 
 ### Running a sweep
 
@@ -177,6 +159,17 @@ For unattended experiments, you can run a sequence of trials from a JSON file:
 uv run run_sweep.py --spec sweep.example.json
 uv run run_sweep.py --spec my_sweep.json --max-runs 5
 ```
+
+### Chain-of-thought + reinforcement learning phase
+
+After the base pretraining loop, `train.py` now includes an optional lightweight reasoning phase:
+
+- Prompts are synthetic arithmetic tasks that explicitly request reasoning in `<think>...</think>` plus a final `<answer>...</answer>`.
+- The model is optimized with policy gradient (REINFORCE-style):
+  - **reward +1** for correct final answer,
+  - **reward -1** for incorrect final answer,
+  - **reward +0.2** bonus for producing explicit `<think>...</think>` reasoning.
+- Summary metrics (`avg_reward`, `avg_accuracy`, `avg_cot_rate`) are saved into run JSON output under `reasoning_rl`.
 
 ## Design choices
 
