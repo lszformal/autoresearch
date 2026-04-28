@@ -155,6 +155,15 @@ uv run run_sweep.py --spec sweep.example.json
 uv run run_sweep.py --spec my_sweep.json --max-runs 5
 ```
 
+You can also stop early when benchmark targets are reached:
+
+```bash
+uv run run_sweep.py \
+  --spec my_sweep.json \
+  --target-hle 64.7 \
+  --target-swepro 77.8
+```
+
 ### Chain-of-thought alignment + reward-based fine-tuning
 
 `train.py` now includes a post-pretraining reasoning alignment stage:
@@ -186,6 +195,32 @@ Reasoning-vaiheen asetukset:
 - `AUTORESEARCH_REASONING_SEQ_LEN`
 - `AUTORESEARCH_REASONING_LR_FRAC`
 - `AUTORESEARCH_REASONING_MAX_INT`
+
+### HLE + SWE-Bench Pro target gating
+
+`train.py` can run external benchmark evaluators and write their metrics into `runs/latest.json`.
+Set evaluator commands with:
+
+- `AUTORESEARCH_EVAL_HLE_CMD`
+- `AUTORESEARCH_EVAL_SWEPRO_CMD`
+
+Evaluator commands must print either:
+
+- JSON: `{"accuracy": 64.7}`
+- or plain float: `64.7`
+
+To enforce minimum targets in CI/autonomous loops:
+
+```bash
+AUTORESEARCH_EVAL_HLE_CMD="python eval_hle.py --json" \
+AUTORESEARCH_EVAL_SWEPRO_CMD="python eval_swebench_pro.py --json" \
+AUTORESEARCH_ENFORCE_TARGETS=1 \
+AUTORESEARCH_TARGET_HLE_ACCURACY=64.7 \
+AUTORESEARCH_TARGET_SWEPRO_ACCURACY=77.8 \
+uv run train.py
+```
+
+If targets are not met, `train.py` exits with non-zero status after writing summary metrics.
 
 ## Design choices
 

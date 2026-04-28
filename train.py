@@ -484,7 +484,6 @@ DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # Post-pretraining reasoning alignment (chain-of-thought + RL reward shaping)
-REASONING_PHASE_ENABLED = True
 REASONING_SFT_STEPS = 32
 REASONING_RL_STEPS = 32
 REASONING_BATCH_SIZE = 32
@@ -542,7 +541,6 @@ WARMDOWN_RATIO = _env_float("AUTORESEARCH_WARMDOWN_RATIO", WARMDOWN_RATIO)
 FINAL_LR_FRAC = _env_float("AUTORESEARCH_FINAL_LR_FRAC", FINAL_LR_FRAC)
 DEPTH = _env_int("AUTORESEARCH_DEPTH", DEPTH)
 DEVICE_BATCH_SIZE = _env_int("AUTORESEARCH_DEVICE_BATCH_SIZE", DEVICE_BATCH_SIZE)
-REASONING_PHASE_ENABLED = _env_bool("AUTORESEARCH_REASONING_PHASE_ENABLED", REASONING_PHASE_ENABLED)
 REASONING_SFT_STEPS = _env_int("AUTORESEARCH_REASONING_SFT_STEPS", REASONING_SFT_STEPS)
 REASONING_RL_STEPS = _env_int("AUTORESEARCH_REASONING_RL_STEPS", REASONING_RL_STEPS)
 REASONING_BATCH_SIZE = _env_int("AUTORESEARCH_REASONING_BATCH_SIZE", REASONING_BATCH_SIZE)
@@ -574,7 +572,6 @@ print(f"  DEPTH={DEPTH} ASPECT_RATIO={ASPECT_RATIO} HEAD_DIM={HEAD_DIM} WINDOW_P
 print(f"  TOTAL_BATCH_SIZE={TOTAL_BATCH_SIZE} DEVICE_BATCH_SIZE={DEVICE_BATCH_SIZE}")
 print(f"  EMBEDDING_LR={EMBEDDING_LR} UNEMBEDDING_LR={UNEMBEDDING_LR} MATRIX_LR={MATRIX_LR} SCALAR_LR={SCALAR_LR}")
 print(f"  WEIGHT_DECAY={WEIGHT_DECAY} ADAM_BETAS={ADAM_BETAS} WARMUP_RATIO={WARMUP_RATIO} WARMDOWN_RATIO={WARMDOWN_RATIO} FINAL_LR_FRAC={FINAL_LR_FRAC}")
-print(f"  REASONING_PHASE_ENABLED={REASONING_PHASE_ENABLED}")
 print(f"  REASONING_SFT_STEPS={REASONING_SFT_STEPS} REASONING_RL_STEPS={REASONING_RL_STEPS} REASONING_BATCH_SIZE={REASONING_BATCH_SIZE}")
 print(f"  REASONING_SEQ_LEN={REASONING_SEQ_LEN} REASONING_LR_FRAC={REASONING_LR_FRAC} REASONING_MAX_INT={REASONING_MAX_INT}")
 
@@ -849,6 +846,46 @@ def run_reasoning_alignment_phase(model, optimizer):
         "rl_accuracy_last": float(rl_accuracy),
     }
 
+
+def _parse_accuracy_output(raw):
+    """Parse evaluator output. Supports JSON {'accuracy': ...} or plain float string."""
+    txt = raw.strip()
+    if not txt:
+        return None
+    try:
+        obj = json.loads(txt)
+        if isinstance(obj, dict) and "accuracy" in obj:
+            return float(obj["accuracy"])
+    except json.JSONDecodeError:
+        pass
+    try:
+        return float(txt)
+    except ValueError:
+        return None
+
+
+def evaluate_external_benchmark(name, cmd):
+    """
+    Run an external benchmark evaluator command.
+    Expected output:
+      - JSON: {"accuracy": 64.7}
+      - or plain float: 64.7
+    """
+    if not cmd:
+        return None
+    print(f"Running external evaluator ({name}): {cmd}")
+    try:
+        out = subprocess.check_output(cmd, shell=True, text=True)
+    except subprocess.CalledProcessError as e:
+        print(f"[{name}] evaluator failed with code {e.returncode}")
+        return None
+    acc = _parse_accuracy_output(out)
+    if acc is None:
+        print(f"[{name}] evaluator output parse failed: {out[:200]!r}")
+        return None
+    print(f"[{name}] accuracy_percent: {acc:.3f}")
+    return acc
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -940,14 +977,13 @@ model.eval()
 reasoning_alignment = run_reasoning_alignment_phase(model, optimizer)
 model.eval()
 with autocast_ctx:
-    val_bpb_raw = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
-val_bpb_ema = None
-if ema_state is not None and ema_updates > 0:
-    backups = copy_ema_to_model(model, ema_state)
-    with autocast_ctx:
-        val_bpb_ema = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
-    restore_model_params(model, backups)
-val_bpb = min(val_bpb_raw, val_bpb_ema) if val_bpb_ema is not None else val_bpb_raw
+    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+hle_accuracy = evaluate_external_benchmark("HLE", os.environ.get("AUTORESEARCH_EVAL_HLE_CMD", ""))
+swebench_pro_accuracy = evaluate_external_benchmark("SWE_BENCH_PRO", os.environ.get("AUTORESEARCH_EVAL_SWEPRO_CMD", ""))
+
+target_hle = _env_float("AUTORESEARCH_TARGET_HLE_ACCURACY", 64.7)
+target_swe = _env_float("AUTORESEARCH_TARGET_SWEPRO_ACCURACY", 77.8)
+enforce_targets = _env_int("AUTORESEARCH_ENFORCE_TARGETS", 0) == 1
 
 # Final summary
 t_end = time.time()
@@ -1003,6 +1039,10 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+if hle_accuracy is not None:
+    print(f"hle_accuracy:     {hle_accuracy:.3f}")
+if swebench_pro_accuracy is not None:
+    print(f"swebench_pro_accuracy: {swebench_pro_accuracy:.3f}")
 
 run_summary = {
     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -1015,6 +1055,8 @@ run_summary = {
         "mfu_percent": float(steady_state_mfu),
         "total_tokens_M": float(total_tokens / 1e6),
         "num_steps": int(step),
+        "hle_accuracy": None if hle_accuracy is None else float(hle_accuracy),
+        "swebench_pro_accuracy": None if swebench_pro_accuracy is None else float(swebench_pro_accuracy),
     },
     "model": {
         "num_params_M": float(num_params / 1e6),
@@ -1039,3 +1081,14 @@ run_summary = {
     "reasoning_alignment": reasoning_alignment,
 }
 save_run_summary(run_summary)
+
+if enforce_targets:
+    hle_ok = hle_accuracy is not None and hle_accuracy >= target_hle
+    swe_ok = swebench_pro_accuracy is not None and swebench_pro_accuracy >= target_swe
+    if not (hle_ok and swe_ok):
+        print(
+            "TARGETS_NOT_MET "
+            f"(need HLE>={target_hle:.1f}, SWE-Bench Pro>={target_swe:.1f}; "
+            f"got HLE={hle_accuracy}, SWE-Bench Pro={swebench_pro_accuracy})"
+        )
+        raise SystemExit(2)
