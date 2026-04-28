@@ -8,22 +8,26 @@ Usage:
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 
 def load_runs(run_dir: Path):
     runs = []
-    skipped = []
     for path in sorted(run_dir.glob("run_*.json")):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
-            payload["_path"] = str(path)
-            payload.setdefault("schema_version", 1)
-            runs.append(payload)
-        except (OSError, json.JSONDecodeError, KeyError, TypeError):
-            skipped.append(path.name)
-    return runs, skipped
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Warning: skipping unreadable run summary {path}: {exc}", file=sys.stderr)
+            continue
+        if not isinstance(payload, dict):
+            print(f"Warning: skipping invalid run summary {path}: expected JSON object", file=sys.stderr)
+            continue
+        # Keep metadata JSON-serializable so `--json` output never fails.
+        payload["_path"] = str(path)
+        runs.append(payload)
+    return runs
 
 
 def print_table(rows):
@@ -51,7 +55,7 @@ def main():
     if not run_dir.exists():
         raise SystemExit(f"Run directory not found: {run_dir}")
 
-    runs, skipped = load_runs(run_dir)
+    runs = load_runs(run_dir)
     if not runs:
         raise SystemExit(f"No run_*.json files found in {run_dir}")
 
@@ -66,7 +70,6 @@ def main():
     for rank, run in enumerate(top, start=1):
         metrics = run["metrics"]
         model = run["model"]
-        run_meta = run.get("run", {})
         rows.append([
             str(rank),
             f'{metrics["val_bpb"]:.6f}',
@@ -75,16 +78,11 @@ def main():
             f'{metrics["total_tokens_M"]:.1f}',
             str(model["depth"]),
             str(model["window_pattern"]),
-            str(run_meta.get("git_commit", "n/a")),
+            str(run.get("git_commit", "unknown")),
             Path(run["_path"]).name,
         ])
 
     print(f"Loaded {len(runs)} runs from {run_dir}")
-    if skipped:
-        print(f"Skipped {len(skipped)} invalid files: {', '.join(skipped[:5])}{'...' if len(skipped) > 5 else ''}")
-    best = ranked[0]["metrics"]["val_bpb"]
-    latest = runs[-1]["metrics"]["val_bpb"]
-    print(f"Best val_bpb: {best:.6f} | Latest val_bpb: {latest:.6f} | Delta(latest-best): {latest - best:+.6f}")
     print_table(rows)
 
 

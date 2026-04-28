@@ -19,6 +19,15 @@
         "AUTORESEARCH_WINDOW_PATTERN": "L",
         "AUTORESEARCH_MATRIX_LR": 0.035
       }
+    },
+    {
+      "name": "reasoning_rl_short",
+      "run_dir": "runs",
+      "overrides": {
+        "AUTORESEARCH_REASONING_ENABLE": true,
+        "AUTORESEARCH_REASONING_BUDGET_SECONDS": 20,
+        "AUTORESEARCH_REASONING_RL_STEPS": 8
+      }
     }
   ]
 }
