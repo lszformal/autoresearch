@@ -752,23 +752,36 @@ def extract_answer(text):
 
 def sample_with_logprobs(model_for_sampling, prompt_ids, max_new_tokens):
     """
-    Sample continuation and keep differentiable log-probs of sampled tokens.
+    Sample continuation tokens first (without graph retention), then compute a
+    single differentiable policy term from a teacher-forced forward pass.
     """
-    x = torch.tensor(prompt_ids, dtype=torch.long, device=device)[None, :]
     sampled = []
-    logprobs = []
-    for _ in range(max_new_tokens):
-        logits = model_for_sampling(x)
-        logits_last = logits[:, -1, :]
-        probs = F.softmax(logits_last, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        token_logprob = F.log_softmax(logits_last, dim=-1).gather(-1, next_token).squeeze(-1)
-        sampled.append(next_token.item())
-        logprobs.append(token_logprob.squeeze(0))
-        x = torch.cat([x, next_token], dim=1)
-        if next_token.item() == tokenizer.get_bos_token_id():
-            break
-    return sampled, logprobs
+    x = torch.tensor(prompt_ids, dtype=torch.long, device=device)[None, :]
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            logits = model_for_sampling(x)
+            logits_last = logits[:, -1, :]
+            probs = F.softmax(logits_last, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            sampled.append(next_token.item())
+            x = torch.cat([x, next_token], dim=1)
+            if next_token.item() == tokenizer.get_bos_token_id():
+                break
+
+    if not sampled:
+        return sampled, None
+
+    full_ids = torch.tensor(prompt_ids + sampled, dtype=torch.long, device=device)[None, :]
+    logits = model_for_sampling(full_ids)
+    sampled_start = len(prompt_ids) - 1
+    sampled_end = sampled_start + len(sampled)
+    logits_for_sampled = logits[:, sampled_start:sampled_end, :]
+    target_tokens = full_ids[:, len(prompt_ids):]
+    token_logprobs = F.log_softmax(logits_for_sampled, dim=-1).gather(
+        -1, target_tokens.unsqueeze(-1)
+    ).squeeze(-1)
+    sample_policy_term = token_logprobs.mean()
+    return sampled, sample_policy_term
 
 
 def run_reasoning_rl_phase(model_for_rl):
@@ -790,15 +803,15 @@ def run_reasoning_rl_phase(model_for_rl):
         cot_present = 0
         for prompt, gold_answer in batch:
             prompt_ids = tokenizer.encode(prompt, prepend=tokenizer.get_bos_token_id())
-            sampled_ids, sampled_logprobs = sample_with_logprobs(model_for_rl, prompt_ids, REASONING_RL_MAX_NEW_TOKENS)
-            if not sampled_logprobs:
+            sampled_ids, sample_policy_term = sample_with_logprobs(model_for_rl, prompt_ids, REASONING_RL_MAX_NEW_TOKENS)
+            if sample_policy_term is None:
                 continue
             completion = tokenizer.decode(sampled_ids)
             pred_answer = extract_answer(completion)
             has_cot = int("<think>" in completion and "</think>" in completion)
             is_correct = int(pred_answer == gold_answer)
             reward = 1.0 * is_correct - 1.0 * (1 - is_correct) + 0.2 * has_cot
-            sample_terms.append(torch.stack(sampled_logprobs).mean())
+            sample_terms.append(sample_policy_term)
             rewards.append(reward)
             correct += is_correct
             cot_present += has_cot
