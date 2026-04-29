@@ -55,8 +55,148 @@ The `program.md` file is essentially a super lightweight "skill".
 prepare.py      — constants, data prep + runtime utilities (do not modify)
 train.py        — model, optimizer, training loop (agent modifies this)
 program.md      — agent instructions
+analyze_runs.py — leaderboard utility for JSON run summaries
+run_sweep.py    — multi-run orchestrator driven by JSON spec + env overrides
+sweep.example.json — example sweep specification
+benchmark_gate.py — checks whether HLE/SWE-Bench Pro score targets are met
 pyproject.toml  — dependencies
 ```
+
+## Experiment tracking and analysis
+
+Each `uv run train.py` execution now writes a machine-readable JSON summary to `runs/`:
+
+- `runs/run_<timestamp>.json` — immutable summary for a specific run.
+- `runs/latest.json` — summary for the most recent run.
+
+This makes it easier for autonomous agents to compare experiments without brittle log parsing.
+
+You can analyze the best runs with:
+
+```bash
+uv run analyze_runs.py
+uv run analyze_runs.py --limit 20
+uv run analyze_runs.py --json
+```
+
+By default, summaries are written to `./runs`; override with `AUTORESEARCH_RUN_DIR=/path/to/runs`.
+
+### Hyperparameter overrides without editing code
+
+`train.py` supports environment-variable overrides so autonomous agents can run parameter sweeps without patching source each time.
+
+Examples:
+
+```bash
+AUTORESEARCH_DEPTH=10 AUTORESEARCH_WINDOW_PATTERN=L uv run train.py
+AUTORESEARCH_MATRIX_LR=0.03 AUTORESEARCH_WEIGHT_DECAY=0.1 uv run train.py
+AUTORESEARCH_ADAM_BETAS=0.85,0.98 uv run train.py
+```
+
+Available overrides:
+
+- `AUTORESEARCH_DEPTH`
+- `AUTORESEARCH_ASPECT_RATIO`
+- `AUTORESEARCH_HEAD_DIM`
+- `AUTORESEARCH_WINDOW_PATTERN`
+- `AUTORESEARCH_TOTAL_BATCH_SIZE`
+- `AUTORESEARCH_DEVICE_BATCH_SIZE`
+- `AUTORESEARCH_EMBEDDING_LR`
+- `AUTORESEARCH_UNEMBEDDING_LR`
+- `AUTORESEARCH_MATRIX_LR`
+- `AUTORESEARCH_SCALAR_LR`
+- `AUTORESEARCH_WEIGHT_DECAY`
+- `AUTORESEARCH_ADAM_BETAS` (format: `"0.8,0.95"`)
+- `AUTORESEARCH_WARMUP_RATIO`
+- `AUTORESEARCH_WARMDOWN_RATIO`
+- `AUTORESEARCH_FINAL_LR_FRAC`
+
+### Running a sweep
+
+For unattended experiments, you can run a sequence of trials from a JSON file:
+
+```bash
+uv run run_sweep.py --spec sweep.example.json
+uv run run_sweep.py --spec my_sweep.json --max-runs 5
+```
+
+#### Autostop-sweep (pysähtyy vasta kun benchmark-tavoitteet täyttyvät)
+
+Nyt `run_sweep.py` tukee autostop-moodia, jossa joka ajon jälkeen:
+
+1. ajetaan ulkoinen eval-komento,
+2. luetaan eval-JSON (`hle`, `swebench_pro`),
+3. tarkistetaan tavoiterajat (HLE ≥ 64.7, SWE-Bench Pro ≥ 77.8),
+4. jatketaan automaattisesti kunnes molemmat rajat täyttyvät.
+
+CLI-esimerkki:
+
+```bash
+uv run run_sweep.py \
+  --spec my_sweep.json \
+  --autostop \
+  --eval-command "python external_eval.py --run-dir \"$AUTORESEARCH_LAST_RUN_DIR\" --out eval_results.json" \
+  --eval-json eval_results.json \
+  --max-total-runs 120
+```
+
+Speciin voi myös lisätä `autostop`-lohkon (katso `sweep.example.json`), jolloin asetuksia ei tarvitse syöttää CLI:ssä joka kerta.
+
+### Chain-of-thought alignment + reward-based fine-tuning
+
+`train.py` now includes a post-pretraining reasoning alignment stage:
+
+1. **SFT vaihe (ajatusketju):** malli opetetaan tuottamaan step-by-step-ratkaisuja yksinkertaisiin laskutehtäviin.
+2. **RL vaihe (palkkio/rangaistus):** mallin lopullista vastaustokenia optimoidaan REINFORCE-tyylisesti: oikeasta vastauksesta palkkio `+1`, väärästä `-1`.
+
+Tämän vaiheen tarkoitus on antaa mallille eksplisiittinen “ajattele ennen vastausta” -harjoitus sekä suora oikeellisuuteen kytketty oppimissignaali.
+
+Voit säätää tai poistaa vaiheen ympäristömuuttujilla:
+
+```bash
+# Disable reasoning alignment entirely
+AUTORESEARCH_REASONING_SFT_STEPS=0 AUTORESEARCH_REASONING_RL_STEPS=0 uv run train.py
+
+# Stronger reasoning training
+AUTORESEARCH_REASONING_SFT_STEPS=64 \
+AUTORESEARCH_REASONING_RL_STEPS=64 \
+AUTORESEARCH_REASONING_BATCH_SIZE=64 \
+AUTORESEARCH_REASONING_LR_FRAC=0.15 \
+uv run train.py
+```
+
+Reasoning-vaiheen asetukset:
+
+- `AUTORESEARCH_REASONING_SFT_STEPS`
+- `AUTORESEARCH_REASONING_RL_STEPS`
+- `AUTORESEARCH_REASONING_BATCH_SIZE`
+- `AUTORESEARCH_REASONING_SEQ_LEN`
+- `AUTORESEARCH_REASONING_LR_FRAC`
+- `AUTORESEARCH_REASONING_MAX_INT`
+
+### Benchmark target gate (HLE + SWE-Bench Pro)
+
+Jos käytät ulkoista eval-järjestelmää (esim. Humanity's Last Exam ja SWE-Bench Pro), voit gate’ta runit selkeillä minimirajoilla:
+
+- HLE: **vähintään 64.7%**
+- SWE-Bench Pro: **vähintään 77.8%**
+
+Komento:
+
+```bash
+uv run benchmark_gate.py --hle 64.9 --swebench-pro 78.0
+```
+
+Tai JSON-syötteestä:
+
+```bash
+uv run benchmark_gate.py --from-json eval_results.json
+```
+
+`train.py` tukee myös näiden scorejen liittämistä ajon yhteenvetoon ympäristömuuttujilla:
+
+- `AUTORESEARCH_HLE_SCORE`
+- `AUTORESEARCH_SWEBENCH_PRO_SCORE`
 
 ## Design choices
 
