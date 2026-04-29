@@ -21,6 +21,12 @@ def load_runs(run_dir: Path):
     return runs
 
 
+def make_json_safe_run(run):
+    safe = dict(run)
+    safe["_path"] = str(run["_path"])
+    return safe
+
+
 def print_table(rows):
     headers = [
         "rank", "val_bpb", "steps", "mfu%", "tokens_M", "depth", "window",
@@ -72,7 +78,7 @@ def main():
     top = ranked[: args.limit]
 
     if args.json:
-        print(json.dumps(top, indent=2))
+        print(json.dumps([make_json_safe_run(run) for run in top], indent=2))
         return
 
     rows = []
