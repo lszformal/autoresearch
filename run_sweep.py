@@ -111,12 +111,12 @@ def main():
     while True:
         for run_cfg in runs:
             run_counter += 1
-            if autostop["max_total_runs"] is not None and run_counter > int(autostop["max_total_runs"]):
-                raise SystemExit(f"Reached max_total_runs={autostop['max_total_runs']} without meeting targets.")
-
             run_dir = run_once(run_counter, run_cfg, base_env)
             if not autostop["enabled"]:
                 continue
+
+            if autostop["max_total_runs"] is not None and run_counter > int(autostop["max_total_runs"]):
+                raise SystemExit(f"Reached max_total_runs={autostop['max_total_runs']} without meeting targets.")
 
             eval_env = base_env.copy()
             eval_env["AUTORESEARCH_LAST_RUN_DIR"] = str(run_dir)
