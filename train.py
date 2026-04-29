@@ -727,12 +727,17 @@ def _pad_or_truncate(ids, target_len, pad_id=0):
 
 def sample_reasoning_examples(batch_size, max_int, require_single_token_answer=False):
     examples = []
-    while len(examples) < batch_size:
+    max_attempts = max(batch_size * 50, 1000)
+    attempts = 0
+    while len(examples) < batch_size and attempts < max_attempts:
+        attempts += 1
         a = random.randint(0, max_int)
         b = random.randint(0, max_int)
         answer = a + b
         ans_text = str(answer)
-        if require_single_token_answer and len(tokenizer.encode(f" {ans_text}")) != 1:
+        # Numeric answers are tokenized without a leading whitespace token in this tokenizer.
+        # Checking " {ans_text}" can never be single-token, causing an infinite sampling loop.
+        if require_single_token_answer and len(tokenizer.encode(ans_text)) != 1:
             continue
         prompt = f"Question: What is {a} + {b}? Think step by step before answering.\nReasoning:"
         completion = f" {a} + {b} = {answer}.\nFinal answer: {answer}"
@@ -743,6 +748,11 @@ def sample_reasoning_examples(batch_size, max_int, require_single_token_answer=F
             "prompt": prompt,
             "completion": completion,
         })
+    if len(examples) < batch_size:
+        raise RuntimeError(
+            f"Unable to sample {batch_size} reasoning examples with single-token numeric answers "
+            f"after {attempts} attempts (max_int={max_int})."
+        )
     return examples
 
 
