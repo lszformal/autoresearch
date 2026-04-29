@@ -725,9 +725,18 @@ def _pad_or_truncate(ids, target_len, pad_id=0):
     return ids + [pad_id] * (target_len - len(ids))
 
 
-def sample_reasoning_examples(batch_size, max_int, require_single_token_answer=False):
+def sample_reasoning_examples(
+    batch_size,
+    max_int,
+    require_single_token_answer=False,
+    max_attempts=None,
+):
     examples = []
-    while len(examples) < batch_size:
+    attempts = 0
+    if max_attempts is None:
+        max_attempts = max(batch_size * 32, 1024)
+    while len(examples) < batch_size and attempts < max_attempts:
+        attempts += 1
         a = random.randint(0, max_int)
         b = random.randint(0, max_int)
         answer = a + b
@@ -743,6 +752,13 @@ def sample_reasoning_examples(batch_size, max_int, require_single_token_answer=F
             "prompt": prompt,
             "completion": completion,
         })
+    if len(examples) < batch_size:
+        raise RuntimeError(
+            "Failed to sample enough reasoning examples within max_attempts="
+            f"{max_attempts}. Collected {len(examples)}/{batch_size}. "
+            "Try increasing max_attempts, lowering REASONING_MAX_INT, or disabling "
+            "single-token-answer requirement for this tokenizer."
+        )
     return examples
 
 
