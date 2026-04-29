@@ -526,6 +526,48 @@ def _safe_git_commit():
         return "unknown"
 
 
+def _parse_benchmark_accuracy(raw_output):
+    """
+    Parse benchmark helper output and return a normalized accuracy in [0, 100].
+
+    Accepts helper outputs like:
+      - "64.7"
+      - "0.647" (interpreted as ratio and scaled to percent)
+      - "accuracy=64.7%"
+    """
+    if raw_output is None:
+        raise ValueError("benchmark output is empty")
+    text = raw_output.strip()
+    if not text:
+        raise ValueError("benchmark output is empty")
+    matches = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text)
+    if not matches:
+        raise ValueError(f"could not parse numeric accuracy from output: {text!r}")
+    value = float(matches[-1])
+    if 0.0 <= value <= 1.0:
+        value *= 100.0
+    return max(0.0, min(100.0, value))
+
+
+def evaluate_external_benchmark(name, cmd):
+    """
+    Run optional external benchmark command and parse accuracy.
+    Returns None when no command is configured or command/parse fails.
+    """
+    command = (cmd or "").strip()
+    if not command:
+        print(f"[{name}] skipped (set AUTORESEARCH_EVAL_*_CMD to enable)")
+        return None
+    try:
+        output = subprocess.check_output(command, shell=True, text=True, stderr=subprocess.STDOUT)
+        accuracy = _parse_benchmark_accuracy(output)
+        print(f"[{name}] accuracy: {accuracy:.2f}")
+        return accuracy
+    except Exception as exc:
+        print(f"[{name}] benchmark helper failed: {exc}")
+        return None
+
+
 # Optional environment-based overrides for autonomous sweeps (no code edits required)
 ASPECT_RATIO = _env_int("AUTORESEARCH_ASPECT_RATIO", ASPECT_RATIO)
 HEAD_DIM = _env_int("AUTORESEARCH_HEAD_DIM", HEAD_DIM)
