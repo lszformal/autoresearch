@@ -29,6 +29,7 @@ repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/fl
 fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from benchmark_targets import HLE_TARGET_ACCURACY, SWEBENCH_PRO_TARGET_ACCURACY
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -434,6 +435,33 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
+
+def _env_bool(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean for {name}: {raw!r}")
+
+
+def _env_int(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else int(raw)
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else float(raw)
+
+
+def _env_str(name, default):
+    raw = os.environ.get(name)
+    return default if raw is None else raw
+
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
@@ -527,9 +555,13 @@ REASONING_TASK_MIX = _env_str("AUTORESEARCH_REASONING_TASK_MIX", REASONING_TASK_
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
 torch.set_float32_matmul_precision("high")
+if REPRO_MODE:
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 H100_BF16_PEAK_FLOPS = 989.5e12
@@ -572,8 +604,58 @@ def build_model_config(depth):
         window_pattern=WINDOW_PATTERN,
     )
 
+
+def init_ema_state(model_for_ema):
+    return [p.detach().clone() for p in model_for_ema.parameters()]
+
+
+@torch.no_grad()
+def update_ema_state(model_for_ema, ema_state, decay):
+    for ema_param, model_param in zip(ema_state, model_for_ema.parameters()):
+        ema_param.mul_(decay).add_(model_param.detach(), alpha=(1.0 - decay))
+
+
+@torch.no_grad()
+def copy_ema_to_model(model_for_ema, ema_state):
+    backups = []
+    for model_param, ema_param in zip(model_for_ema.parameters(), ema_state):
+        backups.append(model_param.detach().clone())
+        model_param.copy_(ema_param)
+    return backups
+
+
+@torch.no_grad()
+def restore_model_params(model_for_ema, backups):
+    for model_param, original in zip(model_for_ema.parameters(), backups):
+        model_param.copy_(original)
+
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
+
+def get_git_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def maybe_write_run_artifacts(summary):
+    summary_path = os.environ.get("AUTORESEARCH_SUMMARY_PATH")
+    if summary_path:
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+            f.write("\n")
+        print(f"summary_path:      {summary_path}")
+
+    metrics_path = os.environ.get("AUTORESEARCH_METRICS_JSONL")
+    if metrics_path:
+        with open(metrics_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(summary, sort_keys=True) + "\n")
+        print(f"metrics_jsonl:     {metrics_path}")
 
 with torch.device("meta"):
     model = GPT(config)
@@ -601,10 +683,13 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
+raw_model = model
 model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
+ema_state = init_ema_state(model) if USE_EMA else None
+ema_updates = 0
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -893,6 +978,9 @@ while True:
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    if ema_state is not None and step >= EMA_WARMUP_STEPS:
+        update_ema_state(model, ema_state, EMA_DECAY)
+        ema_updates += 1
 
     train_loss_f = train_loss.item()
 
@@ -937,12 +1025,25 @@ print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
+# Optional reasoning fine-tuning stage (CoT + reward shaping)
+reasoning_stats = {"enabled": False}
+if REASONING_PHASE_ENABLED:
+    print("---")
+    print("Starting reasoning phase: supervised chain-of-thought + reward optimization")
+    reasoning_stats = run_reasoning_training_phase(model, tokenizer, device)
+
 # Final eval
 model.eval()
 reasoning_alignment = run_reasoning_alignment_phase(model, optimizer)
 model.eval()
 with autocast_ctx:
     val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+hle_accuracy = evaluate_external_benchmark("HLE", os.environ.get("AUTORESEARCH_EVAL_HLE_CMD", ""))
+swebench_pro_accuracy = evaluate_external_benchmark("SWE_BENCH_PRO", os.environ.get("AUTORESEARCH_EVAL_SWEPRO_CMD", ""))
+
+target_hle = _env_float("AUTORESEARCH_TARGET_HLE_ACCURACY", 64.7)
+target_swe = _env_float("AUTORESEARCH_TARGET_SWEPRO_ACCURACY", 77.8)
+enforce_targets = _env_int("AUTORESEARCH_ENFORCE_TARGETS", 0) == 1
 
 # Final summary
 t_end = time.time()
@@ -950,8 +1051,46 @@ startup_time = t_start_training - t_start
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
+summary = {
+    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    "git_commit": get_git_commit(),
+    "seed": SEED,
+    "repro_mode": REPRO_MODE,
+    "torch_version": torch.__version__,
+    "cuda_device": torch.cuda.get_device_name(),
+    "model_config": asdict(config),
+    "hparams": {
+        "aspect_ratio": ASPECT_RATIO,
+        "head_dim": HEAD_DIM,
+        "window_pattern": WINDOW_PATTERN,
+        "total_batch_size": TOTAL_BATCH_SIZE,
+        "device_batch_size": DEVICE_BATCH_SIZE,
+        "embedding_lr": EMBEDDING_LR,
+        "unembedding_lr": UNEMBEDDING_LR,
+        "matrix_lr": MATRIX_LR,
+        "scalar_lr": SCALAR_LR,
+        "weight_decay": WEIGHT_DECAY,
+        "adam_betas": ADAM_BETAS,
+        "warmup_ratio": WARMUP_RATIO,
+        "warmdown_ratio": WARMDOWN_RATIO,
+        "final_lr_frac": FINAL_LR_FRAC,
+        "depth": DEPTH,
+    },
+    "metrics": {
+        "val_bpb": round(val_bpb, 6),
+        "training_seconds": round(total_training_time, 1),
+        "total_seconds": round(t_end - t_start, 1),
+        "peak_vram_mb": round(peak_vram_mb, 1),
+        "mfu_percent": round(steady_state_mfu, 2),
+        "total_tokens_m": round(total_tokens / 1e6, 1),
+        "num_steps": step,
+        "num_params_m": round(num_params / 1e6, 1),
+    },
+}
+
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
+print(f"startup_seconds:  {startup_time:.1f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
