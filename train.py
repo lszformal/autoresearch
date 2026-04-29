@@ -793,8 +793,13 @@ def build_reasoning_rl_batch(batch_size, seq_len):
         ids = ids[-seq_len:]
         lengths.append(len(ids))
         x_rows.append(_pad_or_truncate(ids, seq_len, pad_id=0))
-        answer_tok = tokenizer.encode(f" {ex['answer_text']}")[0]
-        answer_tokens.append(answer_tok)
+        answer_tok_ids = tokenizer.encode(ex["answer_text"])
+        if len(answer_tok_ids) != 1:
+            raise RuntimeError(
+                "Reasoning RL example expected single-token answer, "
+                f"got {len(answer_tok_ids)} tokens for answer {ex['answer_text']!r}."
+            )
+        answer_tokens.append(answer_tok_ids[0])
         answer_texts.append(ex["answer_text"])
     x = torch.tensor(x_rows, dtype=torch.long, device=device)
     answer_tokens = torch.tensor(answer_tokens, dtype=torch.long, device=device)
