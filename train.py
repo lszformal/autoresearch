@@ -871,7 +871,12 @@ def build_reasoning_rl_batch(batch_size, seq_len):
     bos = tokenizer.get_bos_token_id()
     x_rows, lengths, answer_tokens, answer_texts = [], [], [], []
     for ex in examples:
-        prefix = ex["prompt"] + " "
+        final_answer_marker = "Final answer:"
+        if final_answer_marker in ex["completion"]:
+            completion_prefix, _sep, _tail = ex["completion"].rpartition(final_answer_marker)
+            prefix = ex["prompt"] + completion_prefix + final_answer_marker
+        else:
+            prefix = ex["prompt"] + " "
         ids = tokenizer.encode(prefix, prepend=bos)
         ids = ids[-seq_len:]
         lengths.append(len(ids))
