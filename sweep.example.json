@@ -1,4 +1,11 @@
 {
+  "autostop": {
+    "enabled": false,
+    "eval_command": "python external_eval.py --run-dir \"$AUTORESEARCH_LAST_RUN_DIR\" --out eval_results.json",
+    "eval_json": "eval_results.json",
+    "max_total_runs": 100,
+    "cycle_runs": true
+  },
   "runs": [
     {
       "name": "baseline",

@@ -18,6 +18,21 @@ HLE_TARGET = 64.7
 SWEBENCH_PRO_TARGET = 77.8
 
 
+def evaluate_scores(hle: float, swe: float):
+    hle_gap = HLE_TARGET - hle
+    swe_gap = SWEBENCH_PRO_TARGET - swe
+    ok_hle = hle >= HLE_TARGET
+    ok_swe = swe >= SWEBENCH_PRO_TARGET
+    ok = ok_hle and ok_swe
+    return {
+        "ok": ok,
+        "ok_hle": ok_hle,
+        "ok_swe": ok_swe,
+        "hle_gap": hle_gap,
+        "swe_gap": swe_gap,
+    }
+
+
 def load_scores(args):
     if args.from_json is not None:
         with open(args.from_json, "r", encoding="utf-8") as f:
@@ -40,23 +55,19 @@ def main():
     args = parser.parse_args()
 
     hle, swe = load_scores(args)
-    hle_gap = HLE_TARGET - hle
-    swe_gap = SWEBENCH_PRO_TARGET - swe
-    ok_hle = hle >= HLE_TARGET
-    ok_swe = swe >= SWEBENCH_PRO_TARGET
-    ok = ok_hle and ok_swe
+    evaluation = evaluate_scores(hle, swe)
 
     print(f"HLE:          {hle:.2f}% (target {HLE_TARGET:.1f}%)")
     print(f"SWE-BenchPro: {swe:.2f}% (target {SWEBENCH_PRO_TARGET:.1f}%)")
-    if ok:
+    if evaluation["ok"]:
         print("STATUS: PASS (both targets met)")
         raise SystemExit(0)
 
     print("STATUS: FAIL")
-    if not ok_hle:
-        print(f"  HLE gap:          {hle_gap:.2f} pp")
-    if not ok_swe:
-        print(f"  SWE-Bench Pro gap:{swe_gap:.2f} pp")
+    if not evaluation["ok_hle"]:
+        print(f"  HLE gap:          {evaluation['hle_gap']:.2f} pp")
+    if not evaluation["ok_swe"]:
+        print(f"  SWE-Bench Pro gap:{evaluation['swe_gap']:.2f} pp")
     raise SystemExit(1)
 
 

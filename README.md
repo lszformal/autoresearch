@@ -156,37 +156,27 @@ uv run run_sweep.py --spec sweep.example.json
 uv run run_sweep.py --spec my_sweep.json --max-runs 5
 ```
 
-### Autostop-sweep (stops only after real external benchmark pass)
+#### Autostop-sweep (pysähtyy vasta kun benchmark-tavoitteet täyttyvät)
 
-Voit ajaa sweepin “ikuisena” silmukkana, joka pysähtyy vasta kun ulkoinen evaluointi raportoi molemmat rajat täytetyksi:
+Nyt `run_sweep.py` tukee autostop-moodia, jossa joka ajon jälkeen:
 
-- HLE >= 64.7
-- SWE-Bench Pro >= 77.8
+1. ajetaan ulkoinen eval-komento,
+2. luetaan eval-JSON (`hle`, `swebench_pro`),
+3. tarkistetaan tavoiterajat (HLE ≥ 64.7, SWE-Bench Pro ≥ 77.8),
+4. jatketaan automaattisesti kunnes molemmat rajat täyttyvät.
 
-`run_sweep.py --autostop` vaatii ulkoisen eval-komennon, joka tulostaa **viimeiselle stdout-riville** JSON-objektin:
-
-```json
-{"hle": 65.2, "swebench_pro": 78.1}
-```
-
-Esimerkki:
+CLI-esimerkki:
 
 ```bash
 uv run run_sweep.py \
   --spec my_sweep.json \
   --autostop \
-  --eval-cmd "python external_eval.py --run {latest_json}" \
-  --max-cycles 50
+  --eval-command "python external_eval.py --run-dir \"$AUTORESEARCH_LAST_RUN_DIR\" --out eval_results.json" \
+  --eval-json eval_results.json \
+  --max-total-runs 120
 ```
 
-Template-muuttujat `--eval-cmd`:lle:
-
-- `{latest_json}` — viimeisimmän ajon summary-polku
-- `{run_dir}` — ajon run directory
-- `{run_name}` — sweep-entryn nimi
-- `{run_index}` — sweep-entryn indeksi
-
-Autostop-ajon eval-tulokset kirjataan JSONL-lokiin (`runs/autostop_history.jsonl` oletuksena), jota voi käyttää auditointiin ja jatkoanalyysiin.
+Speciin voi myös lisätä `autostop`-lohkon (katso `sweep.example.json`), jolloin asetuksia ei tarvitse syöttää CLI:ssä joka kerta.
 
 ### Chain-of-thought alignment + reward-based fine-tuning
 

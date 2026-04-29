@@ -731,18 +731,17 @@ def sample_reasoning_examples(
     require_single_token_answer=False,
     max_attempts=None,
 ):
-    if max_attempts is None:
-        max_attempts = max(32, batch_size * 64)
-
     examples = []
     attempts = 0
+    if max_attempts is None:
+        max_attempts = max(batch_size * 32, 1024)
     while len(examples) < batch_size and attempts < max_attempts:
         attempts += 1
         a = random.randint(0, max_int)
         b = random.randint(0, max_int)
         answer = a + b
         ans_text = str(answer)
-        if require_single_token_answer and len(tokenizer.encode(ans_text)) != 1:
+        if require_single_token_answer and len(tokenizer.encode(f" {ans_text}")) != 1:
             continue
         prompt = f"Question: What is {a} + {b}? Think step by step before answering.\nReasoning:"
         completion = f" {a} + {b} = {answer}.\nFinal answer: {answer}"
@@ -753,12 +752,12 @@ def sample_reasoning_examples(
             "prompt": prompt,
             "completion": completion,
         })
-
     if len(examples) < batch_size:
         raise RuntimeError(
-            "Unable to sample enough reasoning examples within max_attempts="
-            f"{max_attempts} (collected {len(examples)}/{batch_size}). "
-            "Consider disabling require_single_token_answer or adjusting tokenizer/task settings."
+            "Failed to sample enough reasoning examples within max_attempts="
+            f"{max_attempts}. Collected {len(examples)}/{batch_size}. "
+            "Try increasing max_attempts, lowering REASONING_MAX_INT, or disabling "
+            "single-token-answer requirement for this tokenizer."
         )
     return examples
 
