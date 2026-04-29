@@ -725,9 +725,16 @@ def _pad_or_truncate(ids, target_len, pad_id=0):
     return ids + [pad_id] * (target_len - len(ids))
 
 
-def sample_reasoning_examples(batch_size, max_int, require_single_token_answer=False):
+def sample_reasoning_examples(
+    batch_size,
+    max_int,
+    require_single_token_answer=False,
+    max_attempts=None,
+):
+    if max_attempts is None:
+        max_attempts = max(32, batch_size * 64)
+
     examples = []
-    max_attempts = max(batch_size * 50, 1000)
     attempts = 0
     while len(examples) < batch_size and attempts < max_attempts:
         attempts += 1
@@ -735,8 +742,6 @@ def sample_reasoning_examples(batch_size, max_int, require_single_token_answer=F
         b = random.randint(0, max_int)
         answer = a + b
         ans_text = str(answer)
-        # Numeric answers are tokenized without a leading whitespace token in this tokenizer.
-        # Checking " {ans_text}" can never be single-token, causing an infinite sampling loop.
         if require_single_token_answer and len(tokenizer.encode(ans_text)) != 1:
             continue
         prompt = f"Question: What is {a} + {b}? Think step by step before answering.\nReasoning:"
@@ -748,10 +753,12 @@ def sample_reasoning_examples(batch_size, max_int, require_single_token_answer=F
             "prompt": prompt,
             "completion": completion,
         })
+
     if len(examples) < batch_size:
         raise RuntimeError(
-            f"Unable to sample {batch_size} reasoning examples with single-token numeric answers "
-            f"after {attempts} attempts (max_int={max_int})."
+            "Unable to sample enough reasoning examples within max_attempts="
+            f"{max_attempts} (collected {len(examples)}/{batch_size}). "
+            "Consider disabling require_single_token_answer or adjusting tokenizer/task settings."
         )
     return examples
 
@@ -793,13 +800,8 @@ def build_reasoning_rl_batch(batch_size, seq_len):
         ids = ids[-seq_len:]
         lengths.append(len(ids))
         x_rows.append(_pad_or_truncate(ids, seq_len, pad_id=0))
-        answer_tok_ids = tokenizer.encode(ex["answer_text"])
-        if len(answer_tok_ids) != 1:
-            raise RuntimeError(
-                "Reasoning RL example expected single-token answer, "
-                f"got {len(answer_tok_ids)} tokens for answer {ex['answer_text']!r}."
-            )
-        answer_tokens.append(answer_tok_ids[0])
+        answer_tok = tokenizer.encode(f" {ex['answer_text']}")[0]
+        answer_tokens.append(answer_tok)
         answer_texts.append(ex["answer_text"])
     x = torch.tensor(x_rows, dtype=torch.long, device=device)
     answer_tokens = torch.tensor(answer_tokens, dtype=torch.long, device=device)
