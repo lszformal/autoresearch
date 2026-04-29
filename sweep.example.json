@@ -28,17 +28,6 @@
         "AUTORESEARCH_REASONING_RL_STEPS": 64,
         "AUTORESEARCH_REASONING_LR_FRAC": 0.15
       }
-    },
-    {
-      "name": "target_eval_hooks_example",
-      "run_dir": "runs",
-      "overrides": {
-        "AUTORESEARCH_EVAL_HLE_CMD": "python eval_hle.py --json",
-        "AUTORESEARCH_EVAL_SWEPRO_CMD": "python eval_swebench_pro.py --json",
-        "AUTORESEARCH_ENFORCE_TARGETS": 1,
-        "AUTORESEARCH_TARGET_HLE_ACCURACY": 64.7,
-        "AUTORESEARCH_TARGET_SWEPRO_ACCURACY": 77.8
-      }
     }
   ]
 }

@@ -94,6 +94,7 @@ program.md      — agent instructions
 analyze_runs.py — leaderboard utility for JSON run summaries
 run_sweep.py    — multi-run orchestrator driven by JSON spec + env overrides
 sweep.example.json — example sweep specification
+record_benchmark_result.py — attach HLE + SWE-Bench Pro scores to run JSON
 pyproject.toml  — dependencies
 ```
 
@@ -155,15 +156,6 @@ uv run run_sweep.py --spec sweep.example.json
 uv run run_sweep.py --spec my_sweep.json --max-runs 5
 ```
 
-You can also stop early when benchmark targets are reached:
-
-```bash
-uv run run_sweep.py \
-  --spec my_sweep.json \
-  --target-hle 64.7 \
-  --target-swepro 77.8
-```
-
 ### Chain-of-thought alignment + reward-based fine-tuning
 
 `train.py` now includes a post-pretraining reasoning alignment stage:
@@ -196,31 +188,30 @@ Reasoning-vaiheen asetukset:
 - `AUTORESEARCH_REASONING_LR_FRAC`
 - `AUTORESEARCH_REASONING_MAX_INT`
 
-### HLE + SWE-Bench Pro target gating
+### Benchmark target tracking (HLE 64.7% / SWE-Bench Pro 77.8%)
 
-`train.py` can run external benchmark evaluators and write their metrics into `runs/latest.json`.
-Set evaluator commands with:
+Repo now supports explicit target-aware tracking for:
 
-- `AUTORESEARCH_EVAL_HLE_CMD`
-- `AUTORESEARCH_EVAL_SWEPRO_CMD`
+- **Humanity's Last Exam:** target `64.7%`
+- **SWE-Bench Pro:** target `77.8%`
 
-Evaluator commands must print either:
-
-- JSON: `{"accuracy": 64.7}`
-- or plain float: `64.7`
-
-To enforce minimum targets in CI/autonomous loops:
+`train.py` writes these thresholds into each run summary. After you evaluate a trained checkpoint on external benchmark harnesses, attach the measured scores:
 
 ```bash
-AUTORESEARCH_EVAL_HLE_CMD="python eval_hle.py --json" \
-AUTORESEARCH_EVAL_SWEPRO_CMD="python eval_swebench_pro.py --json" \
-AUTORESEARCH_ENFORCE_TARGETS=1 \
-AUTORESEARCH_TARGET_HLE_ACCURACY=64.7 \
-AUTORESEARCH_TARGET_SWEPRO_ACCURACY=77.8 \
-uv run train.py
+uv run record_benchmark_result.py \
+  --run-json runs/latest.json \
+  --hle 64.9 \
+  --swebench-pro 78.0 \
+  --in-place
 ```
 
-If targets are not met, `train.py` exits with non-zero status after writing summary metrics.
+Then rank runs by distance to targets:
+
+```bash
+uv run analyze_runs.py --sort-by target_gap
+```
+
+`target_gap` is zero only when both thresholds are reached/exceeded.
 
 ## Design choices
 

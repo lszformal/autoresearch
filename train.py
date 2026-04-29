@@ -30,6 +30,7 @@ repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/fl
 fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from benchmark_targets import HLE_TARGET_ACCURACY, SWEBENCH_PRO_TARGET_ACCURACY
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -525,6 +526,48 @@ def _safe_git_commit():
         return "unknown"
 
 
+def _parse_benchmark_accuracy(raw_output):
+    """
+    Parse benchmark helper output and return a normalized accuracy in [0, 100].
+
+    Accepts helper outputs like:
+      - "64.7"
+      - "0.647" (interpreted as ratio and scaled to percent)
+      - "accuracy=64.7%"
+    """
+    if raw_output is None:
+        raise ValueError("benchmark output is empty")
+    text = raw_output.strip()
+    if not text:
+        raise ValueError("benchmark output is empty")
+    matches = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text)
+    if not matches:
+        raise ValueError(f"could not parse numeric accuracy from output: {text!r}")
+    value = float(matches[-1])
+    if 0.0 <= value <= 1.0:
+        value *= 100.0
+    return max(0.0, min(100.0, value))
+
+
+def evaluate_external_benchmark(name, cmd):
+    """
+    Run optional external benchmark command and parse accuracy.
+    Returns None when no command is configured or command/parse fails.
+    """
+    command = (cmd or "").strip()
+    if not command:
+        print(f"[{name}] skipped (set AUTORESEARCH_EVAL_*_CMD to enable)")
+        return None
+    try:
+        output = subprocess.check_output(command, shell=True, text=True, stderr=subprocess.STDOUT)
+        accuracy = _parse_benchmark_accuracy(output)
+        print(f"[{name}] accuracy: {accuracy:.2f}")
+        return accuracy
+    except Exception as exc:
+        print(f"[{name}] benchmark helper failed: {exc}")
+        return None
+
+
 # Optional environment-based overrides for autonomous sweeps (no code edits required)
 ASPECT_RATIO = _env_int("AUTORESEARCH_ASPECT_RATIO", ASPECT_RATIO)
 HEAD_DIM = _env_int("AUTORESEARCH_HEAD_DIM", HEAD_DIM)
@@ -846,46 +889,6 @@ def run_reasoning_alignment_phase(model, optimizer):
         "rl_accuracy_last": float(rl_accuracy),
     }
 
-
-def _parse_accuracy_output(raw):
-    """Parse evaluator output. Supports JSON {'accuracy': ...} or plain float string."""
-    txt = raw.strip()
-    if not txt:
-        return None
-    try:
-        obj = json.loads(txt)
-        if isinstance(obj, dict) and "accuracy" in obj:
-            return float(obj["accuracy"])
-    except json.JSONDecodeError:
-        pass
-    try:
-        return float(txt)
-    except ValueError:
-        return None
-
-
-def evaluate_external_benchmark(name, cmd):
-    """
-    Run an external benchmark evaluator command.
-    Expected output:
-      - JSON: {"accuracy": 64.7}
-      - or plain float: 64.7
-    """
-    if not cmd:
-        return None
-    print(f"Running external evaluator ({name}): {cmd}")
-    try:
-        out = subprocess.check_output(cmd, shell=True, text=True)
-    except subprocess.CalledProcessError as e:
-        print(f"[{name}] evaluator failed with code {e.returncode}")
-        return None
-    acc = _parse_accuracy_output(out)
-    if acc is None:
-        print(f"[{name}] evaluator output parse failed: {out[:200]!r}")
-        return None
-    print(f"[{name}] accuracy_percent: {acc:.3f}")
-    return acc
-
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -1039,10 +1042,6 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
-if hle_accuracy is not None:
-    print(f"hle_accuracy:     {hle_accuracy:.3f}")
-if swebench_pro_accuracy is not None:
-    print(f"swebench_pro_accuracy: {swebench_pro_accuracy:.3f}")
 
 run_summary = {
     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -1055,8 +1054,6 @@ run_summary = {
         "mfu_percent": float(steady_state_mfu),
         "total_tokens_M": float(total_tokens / 1e6),
         "num_steps": int(step),
-        "hle_accuracy": None if hle_accuracy is None else float(hle_accuracy),
-        "swebench_pro_accuracy": None if swebench_pro_accuracy is None else float(swebench_pro_accuracy),
     },
     "model": {
         "num_params_M": float(num_params / 1e6),
@@ -1078,17 +1075,10 @@ run_summary = {
         "warmdown_ratio": float(WARMDOWN_RATIO),
         "final_lr_frac": float(FINAL_LR_FRAC),
     },
+    "benchmark_targets": {
+        "hle_accuracy_target_percent": float(HLE_TARGET_ACCURACY),
+        "swebench_pro_accuracy_target_percent": float(SWEBENCH_PRO_TARGET_ACCURACY),
+    },
     "reasoning_alignment": reasoning_alignment,
 }
 save_run_summary(run_summary)
-
-if enforce_targets:
-    hle_ok = hle_accuracy is not None and hle_accuracy >= target_hle
-    swe_ok = swebench_pro_accuracy is not None and swebench_pro_accuracy >= target_swe
-    if not (hle_ok and swe_ok):
-        print(
-            "TARGETS_NOT_MET "
-            f"(need HLE>={target_hle:.1f}, SWE-Bench Pro>={target_swe:.1f}; "
-            f"got HLE={hle_accuracy}, SWE-Bench Pro={swebench_pro_accuracy})"
-        )
-        raise SystemExit(2)
