@@ -742,7 +742,7 @@ def sample_reasoning_examples(
         b = random.randint(0, max_int)
         answer = a + b
         ans_text = str(answer)
-        if require_single_token_answer and len(tokenizer.encode(f" {ans_text}")) != 1:
+        if require_single_token_answer and len(tokenizer.encode(ans_text)) != 1:
             continue
         prompt = f"Question: What is {a} + {b}? Think step by step before answering.\nReasoning:"
         completion = f" {a} + {b} = {answer}.\nFinal answer: {answer}"
