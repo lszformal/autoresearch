@@ -94,8 +94,7 @@ program.md      — agent instructions
 analyze_runs.py — leaderboard utility for JSON run summaries
 run_sweep.py    — multi-run orchestrator driven by JSON spec + env overrides
 sweep.example.json — example sweep specification
-benchmark_gate.py — threshold checker for benchmark-go/no-go decisions
-eval_metrics.example.json — example benchmark metrics payload
+benchmark_gate.py — checks whether HLE/SWE-Bench Pro score targets are met
 pyproject.toml  — dependencies
 ```
 
@@ -188,23 +187,30 @@ Reasoning-vaiheen asetukset:
 - `AUTORESEARCH_REASONING_SEQ_LEN`
 - `AUTORESEARCH_REASONING_LR_FRAC`
 - `AUTORESEARCH_REASONING_MAX_INT`
-- `AUTORESEARCH_REASONING_TASK_MIX` (format: `"math:0.5,logic:0.2,code:0.3"`)
 
-### Target benchmark gating (HFE + SWE-Bench Pro)
+### Benchmark target gate (HLE + SWE-Bench Pro)
 
-Jos tavoittelet eksplisiittisesti seuraavia tasoja:
+Jos käytät ulkoista eval-järjestelmää (esim. Humanity's Last Exam ja SWE-Bench Pro), voit gate’ta runit selkeillä minimirajoilla:
 
-- **Humanity Final Exam** ≥ **64.7 %**
-- **SWE-Bench Pro** ≥ **77.8 %**
+- HLE: **vähintään 64.7%**
+- SWE-Bench Pro: **vähintään 77.8%**
 
-voit käyttää sisäänrakennettua gate-skriptiä julkaisu-/merge-porttina.
+Komento:
 
 ```bash
-uv run benchmark_gate.py --metrics-file eval_metrics.json
+uv run benchmark_gate.py --hle 64.9 --swebench-pro 78.0
 ```
 
-Oletusarvoisesti scripti epäonnistuu (exit code != 0), jos jompikumpi kynnys alittuu.
-`eval_metrics.example.json` näyttää odotetun tiedostoformaatin.
+Tai JSON-syötteestä:
+
+```bash
+uv run benchmark_gate.py --from-json eval_results.json
+```
+
+`train.py` tukee myös näiden scorejen liittämistä ajon yhteenvetoon ympäristömuuttujilla:
+
+- `AUTORESEARCH_HLE_SCORE`
+- `AUTORESEARCH_SWEBENCH_PRO_SCORE`
 
 ## Design choices
 

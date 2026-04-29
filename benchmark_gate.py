@@ -1,47 +1,63 @@
 """
-Fail-fast gate for target benchmark thresholds.
+Benchmark gate for target scores.
+
+Checks whether a run meets:
+- Humanity's Last Exam (HLE) >= 64.7%
+- SWE-Bench Pro >= 77.8%
 
 Usage:
-    uv run benchmark_gate.py --metrics-file eval_metrics.json
-
-Expected JSON fields:
-    {
-      "humanity_final_exam_accuracy": 64.9,
-      "swe_bench_pro_accuracy": 78.2
-    }
+  uv run benchmark_gate.py --hle 65.1 --swebench-pro 78.2
+  uv run benchmark_gate.py --from-json eval_results.json
 """
 
 import argparse
 import json
-from pathlib import Path
+
+
+HLE_TARGET = 64.7
+SWEBENCH_PRO_TARGET = 77.8
+
+
+def load_scores(args):
+    if args.from_json is not None:
+        with open(args.from_json, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        hle = payload.get("hle")
+        swe = payload.get("swebench_pro")
+    else:
+        hle = args.hle
+        swe = args.swebench_pro
+    if hle is None or swe is None:
+        raise SystemExit("Both HLE and SWE-Bench Pro scores are required.")
+    return float(hle), float(swe)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Check benchmark thresholds for release gating.")
-    parser.add_argument("--metrics-file", required=True, help="Path to JSON metrics file.")
-    parser.add_argument("--hfe-threshold", type=float, default=64.7, help="Humanity Final Exam accuracy threshold (%%).")
-    parser.add_argument("--swe-threshold", type=float, default=77.8, help="SWE-Bench Pro accuracy threshold (%%).")
+    parser = argparse.ArgumentParser(description="Gate benchmark targets for autoresearch runs.")
+    parser.add_argument("--hle", type=float, default=None, help="Humanity's Last Exam score (%%).")
+    parser.add_argument("--swebench-pro", type=float, default=None, help="SWE-Bench Pro score (%%).")
+    parser.add_argument("--from-json", default=None, help="JSON file with keys: hle, swebench_pro.")
     args = parser.parse_args()
 
-    path = Path(args.metrics_file)
-    with open(path, "r", encoding="utf-8") as f:
-        metrics = json.load(f)
+    hle, swe = load_scores(args)
+    hle_gap = HLE_TARGET - hle
+    swe_gap = SWEBENCH_PRO_TARGET - swe
+    ok_hle = hle >= HLE_TARGET
+    ok_swe = swe >= SWEBENCH_PRO_TARGET
+    ok = ok_hle and ok_swe
 
-    hfe = float(metrics.get("humanity_final_exam_accuracy", -1))
-    swe = float(metrics.get("swe_bench_pro_accuracy", -1))
+    print(f"HLE:          {hle:.2f}% (target {HLE_TARGET:.1f}%)")
+    print(f"SWE-BenchPro: {swe:.2f}% (target {SWEBENCH_PRO_TARGET:.1f}%)")
+    if ok:
+        print("STATUS: PASS (both targets met)")
+        raise SystemExit(0)
 
-    print(f"Humanity Final Exam accuracy: {hfe:.2f}% (target >= {args.hfe_threshold:.2f}%)")
-    print(f"SWE-Bench Pro accuracy:      {swe:.2f}% (target >= {args.swe_threshold:.2f}%)")
-
-    failures = []
-    if hfe < args.hfe_threshold:
-        failures.append("humanity_final_exam_accuracy below threshold")
-    if swe < args.swe_threshold:
-        failures.append("swe_bench_pro_accuracy below threshold")
-
-    if failures:
-        raise SystemExit("BENCHMARK GATE FAILED: " + "; ".join(failures))
-    print("BENCHMARK GATE PASSED")
+    print("STATUS: FAIL")
+    if not ok_hle:
+        print(f"  HLE gap:          {hle_gap:.2f} pp")
+    if not ok_swe:
+        print(f"  SWE-Bench Pro gap:{swe_gap:.2f} pp")
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":

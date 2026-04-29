@@ -26,8 +26,7 @@
       "overrides": {
         "AUTORESEARCH_REASONING_SFT_STEPS": 64,
         "AUTORESEARCH_REASONING_RL_STEPS": 64,
-        "AUTORESEARCH_REASONING_LR_FRAC": 0.15,
-        "AUTORESEARCH_REASONING_TASK_MIX": "math:0.3,logic:0.2,code:0.5"
+        "AUTORESEARCH_REASONING_LR_FRAC": 0.15
       }
     }
   ]
