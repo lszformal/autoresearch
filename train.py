@@ -12,7 +12,6 @@ import gc
 import json
 import math
 import random
-import re
 import subprocess
 import time
 from dataclasses import dataclass, asdict
@@ -491,6 +490,7 @@ REASONING_BATCH_SIZE = 32
 REASONING_SEQ_LEN = 128
 REASONING_LR_FRAC = 0.1
 REASONING_MAX_INT = 99
+REASONING_TASK_MIX = "math:0.5,logic:0.2,code:0.3"
 
 
 def _env_str(name, default):
@@ -526,48 +526,6 @@ def _safe_git_commit():
         return "unknown"
 
 
-def _parse_benchmark_accuracy(raw_output):
-    """
-    Parse benchmark helper output and return a normalized accuracy in [0, 100].
-
-    Accepts helper outputs like:
-      - "64.7"
-      - "0.647" (interpreted as ratio and scaled to percent)
-      - "accuracy=64.7%"
-    """
-    if raw_output is None:
-        raise ValueError("benchmark output is empty")
-    text = raw_output.strip()
-    if not text:
-        raise ValueError("benchmark output is empty")
-    matches = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text)
-    if not matches:
-        raise ValueError(f"could not parse numeric accuracy from output: {text!r}")
-    value = float(matches[-1])
-    if 0.0 <= value <= 1.0:
-        value *= 100.0
-    return max(0.0, min(100.0, value))
-
-
-def evaluate_external_benchmark(name, cmd):
-    """
-    Run optional external benchmark command and parse accuracy.
-    Returns None when no command is configured or command/parse fails.
-    """
-    command = (cmd or "").strip()
-    if not command:
-        print(f"[{name}] skipped (set AUTORESEARCH_EVAL_*_CMD to enable)")
-        return None
-    try:
-        output = subprocess.check_output(command, shell=True, text=True, stderr=subprocess.STDOUT)
-        accuracy = _parse_benchmark_accuracy(output)
-        print(f"[{name}] accuracy: {accuracy:.2f}")
-        return accuracy
-    except Exception as exc:
-        print(f"[{name}] benchmark helper failed: {exc}")
-        return None
-
-
 # Optional environment-based overrides for autonomous sweeps (no code edits required)
 ASPECT_RATIO = _env_int("AUTORESEARCH_ASPECT_RATIO", ASPECT_RATIO)
 HEAD_DIM = _env_int("AUTORESEARCH_HEAD_DIM", HEAD_DIM)
@@ -590,6 +548,7 @@ REASONING_BATCH_SIZE = _env_int("AUTORESEARCH_REASONING_BATCH_SIZE", REASONING_B
 REASONING_SEQ_LEN = _env_int("AUTORESEARCH_REASONING_SEQ_LEN", REASONING_SEQ_LEN)
 REASONING_LR_FRAC = _env_float("AUTORESEARCH_REASONING_LR_FRAC", REASONING_LR_FRAC)
 REASONING_MAX_INT = _env_int("AUTORESEARCH_REASONING_MAX_INT", REASONING_MAX_INT)
+REASONING_TASK_MIX = _env_str("AUTORESEARCH_REASONING_TASK_MIX", REASONING_TASK_MIX)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -617,6 +576,7 @@ print(f"  EMBEDDING_LR={EMBEDDING_LR} UNEMBEDDING_LR={UNEMBEDDING_LR} MATRIX_LR=
 print(f"  WEIGHT_DECAY={WEIGHT_DECAY} ADAM_BETAS={ADAM_BETAS} WARMUP_RATIO={WARMUP_RATIO} WARMDOWN_RATIO={WARMDOWN_RATIO} FINAL_LR_FRAC={FINAL_LR_FRAC}")
 print(f"  REASONING_SFT_STEPS={REASONING_SFT_STEPS} REASONING_RL_STEPS={REASONING_RL_STEPS} REASONING_BATCH_SIZE={REASONING_BATCH_SIZE}")
 print(f"  REASONING_SEQ_LEN={REASONING_SEQ_LEN} REASONING_LR_FRAC={REASONING_LR_FRAC} REASONING_MAX_INT={REASONING_MAX_INT}")
+print(f"  REASONING_TASK_MIX={REASONING_TASK_MIX}")
 
 
 def save_run_summary(summary):
@@ -759,29 +719,131 @@ def _pad_or_truncate(ids, target_len, pad_id=0):
     return ids + [pad_id] * (target_len - len(ids))
 
 
-def sample_reasoning_examples(batch_size, max_int, require_single_token_answer=False):
+def _parse_task_mix(spec):
+    pairs = []
+    for chunk in spec.split(","):
+        if not chunk.strip():
+            continue
+        name, weight_s = chunk.split(":")
+        weight = float(weight_s)
+        if weight <= 0:
+            continue
+        pairs.append((name.strip(), weight))
+    if not pairs:
+        return [("math", 1.0)]
+    total = sum(w for _, w in pairs)
+    return [(name, w / total) for name, w in pairs]
+
+
+def _sample_task_name(task_mix):
+    r = random.random()
+    c = 0.0
+    for name, w in task_mix:
+        c += w
+        if r <= c:
+            return name
+    return task_mix[-1][0]
+
+
+def _make_math_example(max_int):
+    a = random.randint(0, max_int)
+    b = random.randint(0, max_int)
+    answer = a + b
+    distractors = {answer}
+    while len(distractors) < 4:
+        distractors.add(max(0, answer + random.randint(-7, 7)))
+    options = sorted(distractors)
+    random.shuffle(options)
+    letters = ["A", "B", "C", "D"]
+    correct_idx = options.index(answer)
+    prompt = (
+        f"Question: What is {a} + {b}? Think step by step before selecting an option.\n"
+        f"Options: A) {options[0]}  B) {options[1]}  C) {options[2]}  D) {options[3]}\nReasoning:"
+    )
+    completion = (
+        f" {a} + {b} = {answer}. The matching option is {letters[correct_idx]}.\n"
+        f"Final answer: {letters[correct_idx]}"
+    )
+    return prompt, completion, letters[correct_idx]
+
+
+def _make_logic_example():
+    person = random.choice(["Alice", "Bob", "Carol", "Dan"])
+    trait_a = random.choice(["scientists", "engineers", "artists", "pilots"])
+    trait_b = random.choice(["careful", "curious", "punctual", "helpful"])
+    premise_true = random.choice([True, False])
+    if premise_true:
+        statement = f"All {trait_a} are {trait_b}. {person} is a {trait_a}. Therefore {person} is {trait_b}."
+        correct = "A"
+    else:
+        statement = f"All {trait_a} are {trait_b}. {person} is {trait_b}. Therefore {person} is a {trait_a}."
+        correct = "B"
+    prompt = (
+        f"Question: Is the conclusion logically valid?\n{statement}\n"
+        "Options: A) Valid  B) Invalid  C) Insufficient data  D) Contradiction\nReasoning:"
+    )
+    completion = (
+        f" The inference is {'valid' if correct == 'A' else 'invalid'} under classical logic.\n"
+        f"Final answer: {correct}"
+    )
+    return prompt, completion, correct
+
+
+def _make_code_example():
+    n = random.randint(2, 7)
+    m = random.randint(2, 5)
+    result = (n + m) * (m - 1)
+    wrongs = [result + 1, result - 1, result + m]
+    options = [result, *wrongs]
+    random.shuffle(options)
+    letters = ["A", "B", "C", "D"]
+    correct = letters[options.index(result)]
+    snippet = (
+        f"x = {n}\n"
+        f"y = {m}\n"
+        "z = x + y\n"
+        "print(z * (y - 1))"
+    )
+    prompt = (
+        "Question: What does this Python snippet print? Think step by step.\n"
+        f"{snippet}\n"
+        f"Options: A) {options[0]}  B) {options[1]}  C) {options[2]}  D) {options[3]}\nReasoning:"
+    )
+    completion = (
+        f" z={n+m} and y-1={m-1}, so output is {(n+m)*(m-1)}.\n"
+        f"Final answer: {correct}"
+    )
+    return prompt, completion, correct
+
+
+def sample_reasoning_examples(batch_size, max_int, task_mix_spec, require_single_token_answer=False):
+    task_mix = _parse_task_mix(task_mix_spec)
     examples = []
     while len(examples) < batch_size:
-        a = random.randint(0, max_int)
-        b = random.randint(0, max_int)
-        answer = a + b
-        ans_text = str(answer)
+        task = _sample_task_name(task_mix)
+        if task == "math":
+            prompt, completion, ans_text = _make_math_example(max_int)
+        elif task == "logic":
+            prompt, completion, ans_text = _make_logic_example()
+        elif task == "code":
+            prompt, completion, ans_text = _make_code_example()
+        else:
+            prompt, completion, ans_text = _make_math_example(max_int)
         if require_single_token_answer and len(tokenizer.encode(f" {ans_text}")) != 1:
             continue
-        prompt = f"Question: What is {a} + {b}? Think step by step before answering.\nReasoning:"
-        completion = f" {a} + {b} = {answer}.\nFinal answer: {answer}"
         examples.append({
-            "a": a,
-            "b": b,
             "answer_text": ans_text,
             "prompt": prompt,
             "completion": completion,
+            "task": task,
         })
     return examples
 
 
 def build_reasoning_sft_batch(batch_size, seq_len):
-    examples = sample_reasoning_examples(batch_size=batch_size, max_int=REASONING_MAX_INT)
+    examples = sample_reasoning_examples(
+        batch_size=batch_size, max_int=REASONING_MAX_INT, task_mix_spec=REASONING_TASK_MIX
+    )
     x_rows, y_rows = [], []
     bos = tokenizer.get_bos_token_id()
     for ex in examples:
@@ -804,15 +866,17 @@ def build_reasoning_sft_batch(batch_size, seq_len):
 
 def build_reasoning_rl_batch(batch_size, seq_len):
     examples = sample_reasoning_examples(
-        batch_size=batch_size, max_int=REASONING_MAX_INT, require_single_token_answer=True
+        batch_size=batch_size, max_int=REASONING_MAX_INT, task_mix_spec=REASONING_TASK_MIX, require_single_token_answer=True
     )
     bos = tokenizer.get_bos_token_id()
     x_rows, lengths, answer_tokens, answer_texts = [], [], [], []
     for ex in examples:
-        prefix = (
-            f"Question: What is {ex['a']} + {ex['b']}? Think step by step before answering.\n"
-            f"Reasoning: {ex['a']} + {ex['b']} = {ex['answer_text']}.\nFinal answer:"
-        )
+        final_answer_marker = "Final answer:"
+        if final_answer_marker in ex["completion"]:
+            completion_prefix, _sep, _tail = ex["completion"].rpartition(final_answer_marker)
+            prefix = ex["prompt"] + completion_prefix + final_answer_marker
+        else:
+            prefix = ex["prompt"] + " "
         ids = tokenizer.encode(prefix, prepend=bos)
         ids = ids[-seq_len:]
         lengths.append(len(ids))
@@ -870,14 +934,12 @@ def run_reasoning_alignment_phase(model, optimizer):
         rl_reward_mean = rewards.mean().item()
         rl_accuracy = (sampled_tokens == answer_tokens).float().mean().item()
         if i % 8 == 0 or i == REASONING_RL_STEPS - 1:
-            sampled_text = tokenizer.decode([sampled_tokens[0].item()])
-            gold_text = answer_texts[0]
-            sampled_num = re.findall(r"-?\d+", sampled_text)
-            sampled_num = sampled_num[-1] if sampled_num else sampled_text.strip()
+            sampled_text = tokenizer.decode([sampled_tokens[0].item()]).strip()
+            gold_text = answer_texts[0].strip()
             print(
                 f"[reasoning-rl] step {i+1}/{REASONING_RL_STEPS} "
                 f"loss={rl_loss.item():.4f} reward_mean={rl_reward_mean:.3f} "
-                f"acc={rl_accuracy:.3f} sample_pred={sampled_num!r} gold={gold_text!r}"
+                f"acc={rl_accuracy:.3f} sample_pred={sampled_text!r} gold={gold_text!r}"
             )
 
     return {
@@ -1074,10 +1136,6 @@ run_summary = {
         "warmup_ratio": float(WARMUP_RATIO),
         "warmdown_ratio": float(WARMDOWN_RATIO),
         "final_lr_frac": float(FINAL_LR_FRAC),
-    },
-    "benchmark_targets": {
-        "hle_accuracy_target_percent": float(HLE_TARGET_ACCURACY),
-        "swebench_pro_accuracy_target_percent": float(SWEBENCH_PRO_TARGET_ACCURACY),
     },
     "reasoning_alignment": reasoning_alignment,
 }

@@ -16,22 +16,13 @@ def load_runs(run_dir: Path):
     for path in sorted(run_dir.glob("run_*.json")):
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
-        payload["_path"] = path
+        payload["_path"] = str(path)
         runs.append(payload)
     return runs
 
 
-def make_json_safe_run(run):
-    safe = dict(run)
-    safe["_path"] = str(run["_path"])
-    return safe
-
-
 def print_table(rows):
-    headers = [
-        "rank", "val_bpb", "steps", "mfu%", "tokens_M", "depth", "window",
-        "commit", "hle%", "swe%", "target_gap", "file"
-    ]
+    headers = ["rank", "val_bpb", "steps", "mfu%", "tokens_M", "depth", "window", "commit", "file"]
     widths = [len(h) for h in headers]
     for row in rows:
         for i, col in enumerate(row):
@@ -49,12 +40,6 @@ def main():
     parser.add_argument("--run-dir", default="runs", help="Directory containing run_*.json files.")
     parser.add_argument("--limit", type=int, default=10, help="How many top runs to print.")
     parser.add_argument("--json", action="store_true", help="Print top runs in JSON format.")
-    parser.add_argument(
-        "--sort-by",
-        choices=["val_bpb", "target_gap"],
-        default="val_bpb",
-        help="Sort by pretraining quality (val_bpb) or benchmark target gap when benchmark_eval is available.",
-    )
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -65,30 +50,17 @@ def main():
     if not runs:
         raise SystemExit(f"No run_*.json files found in {run_dir}")
 
-    def target_gap(run):
-        bench = run.get("benchmark_eval")
-        if not bench:
-            return float("inf")
-        return bench.get("combined_target_gap_percent", float("inf"))
-
-    if args.sort_by == "target_gap":
-        ranked = sorted(runs, key=target_gap)
-    else:
-        ranked = sorted(runs, key=lambda r: r["metrics"]["val_bpb"])
+    ranked = sorted(runs, key=lambda r: r["metrics"]["val_bpb"])
     top = ranked[: args.limit]
 
     if args.json:
-        print(json.dumps([make_json_safe_run(run) for run in top], indent=2))
+        print(json.dumps(top, indent=2))
         return
 
     rows = []
     for rank, run in enumerate(top, start=1):
         metrics = run["metrics"]
         model = run["model"]
-        bench = run.get("benchmark_eval", {})
-        hle = bench.get("hle_accuracy_percent")
-        swe = bench.get("swebench_pro_accuracy_percent")
-        gap = bench.get("combined_target_gap_percent")
         rows.append([
             str(rank),
             f'{metrics["val_bpb"]:.6f}',
@@ -98,10 +70,7 @@ def main():
             str(model["depth"]),
             str(model["window_pattern"]),
             str(run.get("git_commit", "unknown")),
-            f'{hle:.1f}' if hle is not None else "n/a",
-            f'{swe:.1f}' if swe is not None else "n/a",
-            f'{gap:.2f}' if gap is not None else "n/a",
-            run["_path"].name,
+            Path(run["_path"]).name,
         ])
 
     print(f"Loaded {len(runs)} runs from {run_dir}")

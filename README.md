@@ -94,7 +94,8 @@ program.md      — agent instructions
 analyze_runs.py — leaderboard utility for JSON run summaries
 run_sweep.py    — multi-run orchestrator driven by JSON spec + env overrides
 sweep.example.json — example sweep specification
-record_benchmark_result.py — attach HLE + SWE-Bench Pro scores to run JSON
+benchmark_gate.py — threshold checker for benchmark-go/no-go decisions
+eval_metrics.example.json — example benchmark metrics payload
 pyproject.toml  — dependencies
 ```
 
@@ -187,31 +188,23 @@ Reasoning-vaiheen asetukset:
 - `AUTORESEARCH_REASONING_SEQ_LEN`
 - `AUTORESEARCH_REASONING_LR_FRAC`
 - `AUTORESEARCH_REASONING_MAX_INT`
+- `AUTORESEARCH_REASONING_TASK_MIX` (format: `"math:0.5,logic:0.2,code:0.3"`)
 
-### Benchmark target tracking (HLE 64.7% / SWE-Bench Pro 77.8%)
+### Target benchmark gating (HFE + SWE-Bench Pro)
 
-Repo now supports explicit target-aware tracking for:
+Jos tavoittelet eksplisiittisesti seuraavia tasoja:
 
-- **Humanity's Last Exam:** target `64.7%`
-- **SWE-Bench Pro:** target `77.8%`
+- **Humanity Final Exam** ≥ **64.7 %**
+- **SWE-Bench Pro** ≥ **77.8 %**
 
-`train.py` writes these thresholds into each run summary. After you evaluate a trained checkpoint on external benchmark harnesses, attach the measured scores:
-
-```bash
-uv run record_benchmark_result.py \
-  --run-json runs/latest.json \
-  --hle 64.9 \
-  --swebench-pro 78.0 \
-  --in-place
-```
-
-Then rank runs by distance to targets:
+voit käyttää sisäänrakennettua gate-skriptiä julkaisu-/merge-porttina.
 
 ```bash
-uv run analyze_runs.py --sort-by target_gap
+uv run benchmark_gate.py --metrics-file eval_metrics.json
 ```
 
-`target_gap` is zero only when both thresholds are reached/exceeded.
+Oletusarvoisesti scripti epäonnistuu (exit code != 0), jos jompikumpi kynnys alittuu.
+`eval_metrics.example.json` näyttää odotetun tiedostoformaatin.
 
 ## Design choices
 
