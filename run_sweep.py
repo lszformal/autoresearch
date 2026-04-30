@@ -136,6 +136,15 @@ def main():
     parser.add_argument("--hle-target", type=float, default=DEFAULT_HLE_TARGET, help="HLE target percentage.")
     parser.add_argument("--swebench-pro-target", type=float, default=DEFAULT_SWEBENCH_PRO_TARGET, help="SWE-Bench Pro target percentage.")
     parser.add_argument("--sleep-between-cycles", type=float, default=0.0, help="Optional sleep seconds between full sweep cycles in autostop mode.")
+    parser.add_argument(
+        "--max-total-runs",
+        type=int,
+        default=100,
+        help=(
+            "Hard cap on total launched runs in --autostop mode across all cycles. "
+            "Set to a positive integer to bound compute usage."
+        ),
+    )
     args = parser.parse_args()
 
     spec_path = Path(args.spec)
@@ -151,13 +160,22 @@ def main():
     if args.autostop:
         if args.eval_command is None or args.eval_result_json is None:
             raise SystemExit("--autostop requires both --eval-command and --eval-result-json.")
+        if args.max_total_runs is None or args.max_total_runs <= 0:
+            raise SystemExit("--max-total-runs must be a positive integer in --autostop mode.")
         eval_result_json = Path(args.eval_result_json)
         cycle = 0
+        total_runs = 0
         while True:
             cycle += 1
             print(f"\n######## AUTOSTOP SWEEP CYCLE {cycle} ########")
             for i, run_cfg in enumerate(runs, start=1):
+                if total_runs >= args.max_total_runs:
+                    raise SystemExit(
+                        "AUTOSTOP: reached --max-total-runs limit "
+                        f"({args.max_total_runs}) without meeting benchmark targets."
+                    )
                 run_info = run_once(i, run_cfg, base_env, train_command=args.train_command)
+                total_runs += 1
                 ok, _payload = evaluate_and_check_targets(
                     run_info=run_info,
                     eval_command=args.eval_command,
