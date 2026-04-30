@@ -584,6 +584,10 @@ print(f"  REASONING_SFT_STEPS={REASONING_SFT_STEPS} REASONING_RL_STEPS={REASONIN
 print(f"  REASONING_SEQ_LEN={REASONING_SEQ_LEN} REASONING_LR_FRAC={REASONING_LR_FRAC} REASONING_MAX_INT={REASONING_MAX_INT}")
 print(f"  BENCHMARK_HLE_SCORE={BENCHMARK_HLE_SCORE} BENCHMARK_SWEBENCH_PRO_SCORE={BENCHMARK_SWEBENCH_PRO_SCORE}")
 
+MAX_SEQ_LEN_TRAIN = MAX_SEQ_LEN
+if MAX_SEQ_LEN_TRAIN < 1:
+    raise ValueError(f"MAX_SEQ_LEN must be >= 1, got {MAX_SEQ_LEN}.")
+
 
 def save_run_summary(summary):
     """Persist a machine-readable run summary for downstream research tooling."""
@@ -605,7 +609,7 @@ def build_model_config(depth):
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
     return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
+        sequence_len=MAX_SEQ_LEN_TRAIN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )
@@ -676,9 +680,28 @@ num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN_TRAIN
+if tokens_per_fwdbwd < 1:
+    raise ValueError(
+        f"Invalid microbatch token count: DEVICE_BATCH_SIZE ({DEVICE_BATCH_SIZE}) * "
+        f"MAX_SEQ_LEN ({MAX_SEQ_LEN_TRAIN}) must be >= 1."
+    )
+if TOTAL_BATCH_SIZE < tokens_per_fwdbwd:
+    grad_accum_steps = 1
+    effective_total_batch_size = tokens_per_fwdbwd
+    print(
+        "WARNING: TOTAL_BATCH_SIZE is smaller than one microbatch token load; "
+        "using grad_accum_steps=1 and increasing effective total batch size to "
+        f"{effective_total_batch_size}."
+    )
+else:
+    if TOTAL_BATCH_SIZE % tokens_per_fwdbwd != 0:
+        raise ValueError(
+            f"TOTAL_BATCH_SIZE ({TOTAL_BATCH_SIZE}) must be divisible by "
+            f"DEVICE_BATCH_SIZE * MAX_SEQ_LEN ({tokens_per_fwdbwd})."
+        )
+    grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+    effective_total_batch_size = TOTAL_BATCH_SIZE
 
 optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
@@ -692,13 +715,14 @@ optimizer = model.setup_optimizer(
 raw_model = model
 model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN_TRAIN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 ema_state = init_ema_state(model) if USE_EMA else None
 ema_updates = 0
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
+print(f"Effective total batch size (tokens): {effective_total_batch_size}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -910,8 +934,8 @@ while True:
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    tok_per_sec = int(effective_total_batch_size / dt)
+    mfu = 100 * num_flops_per_token * effective_total_batch_size / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
@@ -932,7 +956,7 @@ while True:
 
 print()  # newline after \r training log
 
-total_tokens = step * TOTAL_BATCH_SIZE
+total_tokens = step * effective_total_batch_size
 
 # Optional reasoning fine-tuning stage (CoT + reward shaping)
 reasoning_stats = {"enabled": False}
@@ -946,7 +970,7 @@ model.eval()
 reasoning_alignment = run_reasoning_alignment_phase(model, optimizer)
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, seq_len=MAX_SEQ_LEN_TRAIN)
 hle_accuracy = evaluate_external_benchmark("HLE", os.environ.get("AUTORESEARCH_EVAL_HLE_CMD", ""))
 swebench_pro_accuracy = evaluate_external_benchmark("SWE_BENCH_PRO", os.environ.get("AUTORESEARCH_EVAL_SWEPRO_CMD", ""))
 
@@ -957,7 +981,7 @@ enforce_targets = _env_int("AUTORESEARCH_ENFORCE_TARGETS", 0) == 1
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = 100 * num_flops_per_token * effective_total_batch_size * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 summary = {
@@ -972,7 +996,8 @@ summary = {
         "aspect_ratio": ASPECT_RATIO,
         "head_dim": HEAD_DIM,
         "window_pattern": WINDOW_PATTERN,
-        "total_batch_size": TOTAL_BATCH_SIZE,
+        "configured_total_batch_size": TOTAL_BATCH_SIZE,
+        "effective_total_batch_size": effective_total_batch_size,
         "device_batch_size": DEVICE_BATCH_SIZE,
         "embedding_lr": EMBEDDING_LR,
         "unembedding_lr": UNEMBEDDING_LR,
@@ -1029,7 +1054,8 @@ run_summary = {
         "window_pattern": WINDOW_PATTERN,
     },
     "optimization": {
-        "total_batch_size": int(TOTAL_BATCH_SIZE),
+        "configured_total_batch_size": int(TOTAL_BATCH_SIZE),
+        "effective_total_batch_size": int(effective_total_batch_size),
         "device_batch_size": int(DEVICE_BATCH_SIZE),
         "embedding_lr": float(EMBEDDING_LR),
         "unembedding_lr": float(UNEMBEDDING_LR),

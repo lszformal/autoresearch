@@ -27,7 +27,7 @@ import torch
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
+MAX_SEQ_LEN = 2_000_000  # context length (>= 2,000,000 characters target)
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
 EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 
@@ -341,17 +341,19 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_bpb(model, tokenizer, batch_size, seq_len=MAX_SEQ_LEN):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
     Sums per-token cross-entropy (in nats), sums target byte lengths,
     then converts nats/byte to bits/byte. Special tokens (byte length 0)
     are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    Uses a fixed sequence length per run so results are comparable across evals.
     """
     token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
+    eval_seq_len = min(seq_len, max(1, EVAL_TOKENS // batch_size))
+    val_loader = make_dataloader(tokenizer, batch_size, eval_seq_len, "val")
+    tokens_per_step = batch_size * eval_seq_len
+    steps = max(1, EVAL_TOKENS // tokens_per_step)
     total_nats = 0.0
     total_bytes = 0
     for _ in range(steps):
