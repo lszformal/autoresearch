@@ -350,8 +350,9 @@ def evaluate_bpb(model, tokenizer, batch_size, seq_len=MAX_SEQ_LEN):
     Uses a fixed sequence length per run so results are comparable across evals.
     """
     token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, seq_len, "val")
-    tokens_per_step = batch_size * seq_len
+    eval_seq_len = min(seq_len, max(1, EVAL_TOKENS // batch_size))
+    val_loader = make_dataloader(tokenizer, batch_size, eval_seq_len, "val")
+    tokens_per_step = batch_size * eval_seq_len
     steps = max(1, EVAL_TOKENS // tokens_per_step)
     total_nats = 0.0
     total_bytes = 0

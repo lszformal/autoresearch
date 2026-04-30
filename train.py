@@ -934,8 +934,8 @@ while True:
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    tok_per_sec = int(effective_total_batch_size / dt)
+    mfu = 100 * num_flops_per_token * effective_total_batch_size / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
@@ -956,7 +956,7 @@ while True:
 
 print()  # newline after \r training log
 
-total_tokens = step * TOTAL_BATCH_SIZE
+total_tokens = step * effective_total_batch_size
 
 # Optional reasoning fine-tuning stage (CoT + reward shaping)
 reasoning_stats = {"enabled": False}
@@ -981,7 +981,7 @@ enforce_targets = _env_int("AUTORESEARCH_ENFORCE_TARGETS", 0) == 1
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = 100 * num_flops_per_token * effective_total_batch_size * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 summary = {
@@ -996,7 +996,8 @@ summary = {
         "aspect_ratio": ASPECT_RATIO,
         "head_dim": HEAD_DIM,
         "window_pattern": WINDOW_PATTERN,
-        "total_batch_size": TOTAL_BATCH_SIZE,
+        "configured_total_batch_size": TOTAL_BATCH_SIZE,
+        "effective_total_batch_size": effective_total_batch_size,
         "device_batch_size": DEVICE_BATCH_SIZE,
         "embedding_lr": EMBEDDING_LR,
         "unembedding_lr": UNEMBEDDING_LR,
@@ -1053,7 +1054,8 @@ run_summary = {
         "window_pattern": WINDOW_PATTERN,
     },
     "optimization": {
-        "total_batch_size": int(TOTAL_BATCH_SIZE),
+        "configured_total_batch_size": int(TOTAL_BATCH_SIZE),
+        "effective_total_batch_size": int(effective_total_batch_size),
         "device_batch_size": int(DEVICE_BATCH_SIZE),
         "embedding_lr": float(EMBEDDING_LR),
         "unembedding_lr": float(UNEMBEDDING_LR),
