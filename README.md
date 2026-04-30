@@ -156,25 +156,27 @@ uv run run_sweep.py --spec sweep.example.json
 uv run run_sweep.py --spec my_sweep.json --max-runs 5
 ```
 
-Autostop-sweep (jatkaa automaattisesti cyclejä kunnes ulkoisen evalin tavoiterajat täyttyvät):
+Autostop-looppi ulkoisen evaluoinnin kanssa (jatkaa kunnes molemmat tavoitteet täyttyvät):
 
 ```bash
 uv run run_sweep.py \
   --spec my_sweep.json \
   --autostop \
-  --eval-command "python external_eval.py --run {latest_summary} --out {eval_json}" \
-  --eval-result-json eval_results.json
+  --loop \
+  --eval-cmd "python external_eval.py --run-dir {run_dir} --run-name {run_name}" \
+  --max-total-runs 200
 ```
 
-Autostop pysähtyy vasta kun **molemmat** ehdot täyttyvät:
-- HLE >= 64.7
-- SWE-Bench Pro >= 77.8
+`--eval-cmd` tulee palauttaa JSON stdoutiin muodossa:
 
-Template-muuttujat `--eval-command`-kentässä:
-- `{run_dir}`
-- `{run_name}`
-- `{latest_summary}`
-- `{eval_json}`
+```json
+{"hle": 64.9, "swebench_pro": 78.1}
+```
+
+Placeholderit:
+- `{run_dir}` — ajon output-hakemisto
+- `{run_name}` — sweep-rivin nimi
+- `{run_index}` — juokseva indeksinumero
 
 ### Chain-of-thought alignment + reward-based fine-tuning
 
@@ -231,6 +233,8 @@ uv run benchmark_gate.py --from-json eval_results.json
 
 - `AUTORESEARCH_HLE_SCORE`
 - `AUTORESEARCH_SWEBENCH_PRO_SCORE`
+
+Huom: `benchmark_gate.py` on yksittäisen mittauksen tarkistus. `run_sweep.py --autostop --loop` on pidemmälle menevä orkestrointi, joka ajaa treenit + ulkoisen evalin iteratiivisesti ja pysähtyy automaattisesti vasta, kun molemmat tavoitteet on saavutettu.
 
 ## Design choices
 

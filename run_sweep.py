@@ -4,20 +4,19 @@ Run multiple autoresearch experiments with environment-variable overrides.
 Usage:
     uv run run_sweep.py --spec sweep.example.json
     uv run run_sweep.py --spec my_sweep.json --max-runs 5
-    uv run run_sweep.py --spec my_sweep.json --autostop --eval-command "python external_eval.py --run {latest_summary} --out eval.json" --eval-result-json eval.json
+    uv run run_sweep.py --spec my_sweep.json --autostop --loop \
+      --eval-cmd "python external_eval.py --run-dir {run_dir} --run-name {run_name}"
 """
 
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
-import time
 from pathlib import Path
 
-
-DEFAULT_HLE_TARGET = 64.7
-DEFAULT_SWEBENCH_PRO_TARGET = 77.8
+from benchmark_gate import HLE_TARGET, SWEBENCH_PRO_TARGET, evaluate_scores
 
 
 def load_spec(path: Path):
@@ -28,14 +27,7 @@ def load_spec(path: Path):
     return payload
 
 
-def render_template(template: str, values: dict):
-    rendered = template
-    for key, value in values.items():
-        rendered = rendered.replace("{" + key + "}", str(value))
-    return rendered
-
-
-def run_once(index: int, run_cfg: dict, base_env: dict, train_command: str | None = None):
+def run_once(index: int, run_cfg: dict, base_env: dict):
     env = base_env.copy()
     env["AUTORESEARCH_RUN_DIR"] = run_cfg.get("run_dir", "runs")
     overrides = run_cfg.get("overrides", {})
@@ -52,99 +44,58 @@ def run_once(index: int, run_cfg: dict, base_env: dict, train_command: str | Non
         print("overrides: (none)")
     print(f"run_dir: {env['AUTORESEARCH_RUN_DIR']}")
 
-    if train_command is None:
-        subprocess.run([sys.executable, "train.py"], env=env, check=True)
-    else:
-        rendered = render_template(train_command, {
-            "run_dir": env["AUTORESEARCH_RUN_DIR"],
-            "run_name": name,
-            "run_index": index,
-        })
-        subprocess.run(rendered, env=env, shell=True, check=True)
-
-    latest_summary = Path(env["AUTORESEARCH_RUN_DIR"]) / "latest.json"
-    if not latest_summary.exists():
-        raise SystemExit(f"Expected latest run summary at {latest_summary}, but file is missing.")
-    return {
-        "run_dir": env["AUTORESEARCH_RUN_DIR"],
-        "run_name": name,
-        "latest_summary": latest_summary,
-    }
+    subprocess.run([sys.executable, "train.py"], env=env, check=True)
+    return {"run_name": name, "run_dir": env["AUTORESEARCH_RUN_DIR"], "index": index}
 
 
-def load_eval_scores(eval_result_json: Path):
-    with open(eval_result_json, "r", encoding="utf-8") as f:
-        payload = json.load(f)
+def _parse_eval_stdout(stdout: str):
+    text = stdout.strip()
+    if not text:
+        raise ValueError("External evaluator returned empty stdout.")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        lines = [line for line in text.splitlines() if line.strip()]
+        if not lines:
+            raise ValueError("External evaluator stdout had no parseable content.")
+        payload = json.loads(lines[-1])
     hle = payload.get("hle")
     swebench_pro = payload.get("swebench_pro")
     if hle is None or swebench_pro is None:
-        raise SystemExit(
-            f"Eval JSON {eval_result_json} must contain keys 'hle' and 'swebench_pro'. "
-            f"Got keys: {sorted(payload.keys())}"
-        )
+        raise ValueError("External evaluator output JSON must contain keys: hle, swebench_pro.")
     return float(hle), float(swebench_pro), payload
 
 
-def evaluate_and_check_targets(
-    run_info: dict,
-    eval_command: str,
-    eval_result_json: Path,
-    hle_target: float,
-    swebench_target: float,
-):
-    rendered = render_template(eval_command, {
-        "run_dir": run_info["run_dir"],
-        "run_name": run_info["run_name"],
-        "latest_summary": str(run_info["latest_summary"]),
-        "eval_json": str(eval_result_json),
-    })
-    subprocess.run(rendered, shell=True, check=True)
-    hle, swebench_pro, payload = load_eval_scores(eval_result_json)
-    ok = (hle >= hle_target) and (swebench_pro >= swebench_target)
-    print(
-        f"[autostop-eval] hle={hle:.2f}% (target {hle_target:.1f}%) | "
-        f"swebench_pro={swebench_pro:.2f}% (target {swebench_target:.1f}%) | pass={ok}"
+def run_external_eval(eval_cmd_template: str, run_meta: dict):
+    cmd = eval_cmd_template.format(
+        run_dir=run_meta["run_dir"],
+        run_name=run_meta["run_name"],
+        run_index=run_meta["index"],
     )
-    if not ok:
-        print(
-            f"[autostop-eval] gaps => "
-            f"hle_gap={max(0.0, hle_target - hle):.2f}pp, "
-            f"swebench_gap={max(0.0, swebench_target - swebench_pro):.2f}pp"
-        )
-    return ok, payload
+    print(f"[eval] running: {cmd}")
+    proc = subprocess.run(
+        shlex.split(cmd),
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    if proc.stderr.strip():
+        print(f"[eval] stderr:\n{proc.stderr.strip()}")
+    hle, swebench_pro, payload = _parse_eval_stdout(proc.stdout)
+    return hle, swebench_pro, payload
 
 
 def main():
     parser = argparse.ArgumentParser(description="Execute a sequence of autoresearch runs.")
     parser.add_argument("--spec", required=True, help="Path to JSON sweep spec.")
     parser.add_argument("--max-runs", type=int, default=None, help="Optional cap for number of runs.")
-    parser.add_argument("--train-command", default=None, help="Optional shell command override for each train run.")
-    parser.add_argument("--autostop", action="store_true", help="Loop sweep until benchmark targets are met.")
-    parser.add_argument(
-        "--eval-command",
-        default=None,
-        help=(
-            "Shell command to run external evaluation after each run. "
-            "Template variables: {run_dir}, {run_name}, {latest_summary}, {eval_json}."
-        ),
-    )
-    parser.add_argument(
-        "--eval-result-json",
-        default=None,
-        help="Path to evaluator output JSON with keys: hle, swebench_pro.",
-    )
-    parser.add_argument("--hle-target", type=float, default=DEFAULT_HLE_TARGET, help="HLE target percentage.")
-    parser.add_argument("--swebench-pro-target", type=float, default=DEFAULT_SWEBENCH_PRO_TARGET, help="SWE-Bench Pro target percentage.")
-    parser.add_argument("--sleep-between-cycles", type=float, default=0.0, help="Optional sleep seconds between full sweep cycles in autostop mode.")
-    parser.add_argument(
-        "--max-total-runs",
-        type=int,
-        default=100,
-        help=(
-            "Hard cap on total launched runs in --autostop mode across all cycles. "
-            "Set to a positive integer to bound compute usage."
-        ),
-    )
+    parser.add_argument("--autostop", action="store_true", help="Stop only when both benchmark targets are met.")
+    parser.add_argument("--loop", action="store_true", help="Loop over sweep spec repeatedly (use with --autostop).")
+    parser.add_argument("--eval-cmd", default=None, help=(
+        "External evaluator command template. Must print JSON with keys "
+        "'hle' and 'swebench_pro'. Placeholders: {run_dir}, {run_name}, {run_index}."
+    ))
+    parser.add_argument("--max-total-runs", type=int, default=200, help="Safety cap for total runs in loop mode.")
     args = parser.parse_args()
 
     spec_path = Path(args.spec)
@@ -156,42 +107,44 @@ def main():
     if not runs:
         raise SystemExit("No runs to execute after applying filters.")
 
+    if args.autostop and not args.eval_cmd:
+        raise SystemExit("--autostop requires --eval-cmd so benchmark scores can be checked externally.")
+
     base_env = os.environ.copy()
-    if args.autostop:
-        if args.eval_command is None or args.eval_result_json is None:
-            raise SystemExit("--autostop requires both --eval-command and --eval-result-json.")
-        if args.max_total_runs is None or args.max_total_runs <= 0:
-            raise SystemExit("--max-total-runs must be a positive integer in --autostop mode.")
-        eval_result_json = Path(args.eval_result_json)
-        cycle = 0
-        total_runs = 0
-        while True:
-            cycle += 1
-            print(f"\n######## AUTOSTOP SWEEP CYCLE {cycle} ########")
-            for i, run_cfg in enumerate(runs, start=1):
-                if total_runs >= args.max_total_runs:
-                    raise SystemExit(
-                        "AUTOSTOP: reached --max-total-runs limit "
-                        f"({args.max_total_runs}) without meeting benchmark targets."
-                    )
-                run_info = run_once(i, run_cfg, base_env, train_command=args.train_command)
-                total_runs += 1
-                ok, _payload = evaluate_and_check_targets(
-                    run_info=run_info,
-                    eval_command=args.eval_command,
-                    eval_result_json=eval_result_json,
-                    hle_target=args.hle_target,
-                    swebench_target=args.swebench_pro_target,
-                )
-                if ok:
-                    print("\nAUTOSTOP: benchmark targets reached, stopping sweep.")
-                    return
-            if args.sleep_between_cycles > 0:
-                print(f"Cycle completed without meeting targets; sleeping {args.sleep_between_cycles}s.")
-                time.sleep(args.sleep_between_cycles)
-    else:
+    total_runs = 0
+    sweep_round = 0
+    while True:
+        sweep_round += 1
+        print(f"\n========== Sweep round {sweep_round} ==========")
         for i, run_cfg in enumerate(runs, start=1):
-            run_once(i, run_cfg, base_env, train_command=args.train_command)
+            total_runs += 1
+            run_meta = run_once(total_runs, run_cfg, base_env)
+            if args.autostop:
+                hle, swebench_pro, payload = run_external_eval(args.eval_cmd, run_meta)
+                result = evaluate_scores(hle, swebench_pro)
+                print(
+                    f"[eval] hle={hle:.2f}% (target {HLE_TARGET:.1f}%), "
+                    f"swebench_pro={swebench_pro:.2f}% (target {SWEBENCH_PRO_TARGET:.1f}%)"
+                )
+                if result["ok"]:
+                    print("[autostop] Targets met. Stopping sweep.")
+                    return
+                print(
+                    "[autostop] Targets not met yet. "
+                    f"Gaps: HLE={result['hle_gap']:.2f}pp, SWE-Bench Pro={result['swebench_pro_gap']:.2f}pp"
+                )
+                print(f"[autostop] Raw evaluator payload: {json.dumps(payload, ensure_ascii=False)}")
+
+            if args.max_total_runs is not None and total_runs >= args.max_total_runs:
+                raise SystemExit(
+                    f"Reached --max-total-runs={args.max_total_runs} before meeting benchmark targets."
+                )
+
+        if not args.loop:
+            break
+
+    if args.autostop:
+        raise SystemExit("Sweep completed but benchmark targets were not met.")
 
 
 if __name__ == "__main__":
