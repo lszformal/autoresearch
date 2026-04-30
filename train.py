@@ -584,6 +584,18 @@ print(f"  REASONING_SFT_STEPS={REASONING_SFT_STEPS} REASONING_RL_STEPS={REASONIN
 print(f"  REASONING_SEQ_LEN={REASONING_SEQ_LEN} REASONING_LR_FRAC={REASONING_LR_FRAC} REASONING_MAX_INT={REASONING_MAX_INT}")
 print(f"  BENCHMARK_HLE_SCORE={BENCHMARK_HLE_SCORE} BENCHMARK_SWEBENCH_PRO_SCORE={BENCHMARK_SWEBENCH_PRO_SCORE}")
 
+MAX_SEQ_LEN_TRAIN = min(MAX_SEQ_LEN, TOTAL_BATCH_SIZE // DEVICE_BATCH_SIZE)
+if MAX_SEQ_LEN_TRAIN < 1:
+    raise ValueError(
+        f"Invalid batch setup: TOTAL_BATCH_SIZE ({TOTAL_BATCH_SIZE}) must be >= "
+        f"DEVICE_BATCH_SIZE ({DEVICE_BATCH_SIZE})."
+    )
+if MAX_SEQ_LEN_TRAIN < MAX_SEQ_LEN:
+    print(
+        "WARNING: Capping training/eval sequence length to keep batch math runnable: "
+        f"requested MAX_SEQ_LEN={MAX_SEQ_LEN}, effective_seq_len={MAX_SEQ_LEN_TRAIN}."
+    )
+
 
 def save_run_summary(summary):
     """Persist a machine-readable run summary for downstream research tooling."""
@@ -605,7 +617,7 @@ def build_model_config(depth):
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
     return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
+        sequence_len=MAX_SEQ_LEN_TRAIN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )
@@ -676,7 +688,7 @@ num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
+tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN_TRAIN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
@@ -692,7 +704,7 @@ optimizer = model.setup_optimizer(
 raw_model = model
 model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN_TRAIN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 ema_state = init_ema_state(model) if USE_EMA else None
 ema_updates = 0
@@ -946,7 +958,7 @@ model.eval()
 reasoning_alignment = run_reasoning_alignment_phase(model, optimizer)
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, seq_len=MAX_SEQ_LEN_TRAIN)
 hle_accuracy = evaluate_external_benchmark("HLE", os.environ.get("AUTORESEARCH_EVAL_HLE_CMD", ""))
 swebench_pro_accuracy = evaluate_external_benchmark("SWE_BENCH_PRO", os.environ.get("AUTORESEARCH_EVAL_SWEPRO_CMD", ""))
 
