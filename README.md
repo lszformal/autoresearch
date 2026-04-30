@@ -156,27 +156,25 @@ uv run run_sweep.py --spec sweep.example.json
 uv run run_sweep.py --spec my_sweep.json --max-runs 5
 ```
 
-#### Autostop-sweep (pysähtyy vasta kun benchmark-tavoitteet täyttyvät)
-
-Nyt `run_sweep.py` tukee autostop-moodia, jossa joka ajon jälkeen:
-
-1. ajetaan ulkoinen eval-komento,
-2. luetaan eval-JSON (`hle`, `swebench_pro`),
-3. tarkistetaan tavoiterajat (HLE ≥ 64.7, SWE-Bench Pro ≥ 77.8),
-4. jatketaan automaattisesti kunnes molemmat rajat täyttyvät.
-
-CLI-esimerkki:
+Autostop-sweep (jatkaa automaattisesti cyclejä kunnes ulkoisen evalin tavoiterajat täyttyvät):
 
 ```bash
 uv run run_sweep.py \
   --spec my_sweep.json \
   --autostop \
-  --eval-command "python external_eval.py --run-dir \"$AUTORESEARCH_LAST_RUN_DIR\" --out eval_results.json" \
-  --eval-json eval_results.json \
-  --max-total-runs 120
+  --eval-command "python external_eval.py --run {latest_summary} --out {eval_json}" \
+  --eval-result-json eval_results.json
 ```
 
-Speciin voi myös lisätä `autostop`-lohkon (katso `sweep.example.json`), jolloin asetuksia ei tarvitse syöttää CLI:ssä joka kerta.
+Autostop pysähtyy vasta kun **molemmat** ehdot täyttyvät:
+- HLE >= 64.7
+- SWE-Bench Pro >= 77.8
+
+Template-muuttujat `--eval-command`-kentässä:
+- `{run_dir}`
+- `{run_name}`
+- `{latest_summary}`
+- `{eval_json}`
 
 ### Chain-of-thought alignment + reward-based fine-tuning
 

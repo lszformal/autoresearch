@@ -734,7 +734,7 @@ def sample_reasoning_examples(
     examples = []
     attempts = 0
     if max_attempts is None:
-        max_attempts = max(batch_size * 32, 1024)
+        max_attempts = max(batch_size * 32, 128)
     while len(examples) < batch_size and attempts < max_attempts:
         attempts += 1
         a = random.randint(0, max_int)
@@ -753,11 +753,16 @@ def sample_reasoning_examples(
             "completion": completion,
         })
     if len(examples) < batch_size:
+        if require_single_token_answer:
+            raise RuntimeError(
+                "Could not sample enough reasoning examples with single-token answers "
+                f"(got {len(examples)}/{batch_size} after {attempts} attempts). "
+                "Increase REASONING_MAX_INT, disable single-token requirement, "
+                "or use a tokenizer where numeric answers can be single tokens."
+            )
         raise RuntimeError(
-            "Failed to sample enough reasoning examples within max_attempts="
-            f"{max_attempts}. Collected {len(examples)}/{batch_size}. "
-            "Try increasing max_attempts, lowering REASONING_MAX_INT, or disabling "
-            "single-token-answer requirement for this tokenizer."
+            "Could not sample enough reasoning examples "
+            f"(got {len(examples)}/{batch_size} after {attempts} attempts)."
         )
     return examples
 
